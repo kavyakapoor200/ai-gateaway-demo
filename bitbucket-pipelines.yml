@@ -1,0 +1,15 @@
+image: atlassian/default-image:latest
+
+definitions:
+  steps:
+    - step: &secret_scan
+        name: Secret Scan
+        script:
+          - set -e
+          - pipe: atlassian/git-secrets-scan:3.2.0
+            variables:
+              DEBUG: "true"
+
+pipelines:
+  default:
+    - step: *secret_scan

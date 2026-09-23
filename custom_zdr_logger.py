@@ -1,0 +1,346 @@
+"""
+Minimal Local AI Gateway: Hardened Zero Data Retention (ZDR) Audit Logger
+------------------------------------------------------------------------
+Custom LiteLLM callback logger for the Minimal Local AI Gateway PoC.
+Features:
+1. In-RAM Cryptographic SHA-256 Hashing: 0 bytes of cleartext prompts/completions persisted.
+2. Zero-Touch Task Correlation: Deterministic root-prompt hashing (messages[1] -> task_id).
+3. In-Flight Branch Sniffing: Detects git branch tool calls/messages, writes bhash:<sha256> -> task_id to Redis.
+4. Single-Table SQLite Ledger: Writes operational metadata directly into gateway_audit_ledger (WAL mode).
+"""
+
+import os
+import sys
+import re
+import json
+import time
+import uuid
+import hashlib
+import sqlite3
+import socket
+from typing import Any, Dict, Optional, List
+
+# Gracefully inherit from LiteLLM CustomLogger if installed
+try:
+    from litellm.integrations.custom_logger import CustomLogger
+except ImportError:
+    class CustomLogger:
+        """Standalone fallback for offline test and benchmark execution."""
+        pass
+
+
+class ZDRAuditLogger(CustomLogger):
+    """
+    Hardened ZDR Audit Logger compliant with sqlite_schema.sql (gateway_audit_ledger).
+    Calculates SHA-256 digests in memory and records zero plaintext.
+    """
+
+    def __init__(self, db_path: Optional[str] = None, redis_host: Optional[str] = None, redis_port: Optional[int] = None):
+        super().__init__()
+        # Determine database path
+        if db_path:
+            self.db_path = db_path
+        elif os.environ.get("DB_PATH"):
+            self.db_path = os.environ.get("DB_PATH")
+        elif os.path.exists("/app"):
+            self.db_path = "/app/gateway.db"
+        else:
+            self.db_path = "gateway.db"
+
+        self.redis_host = redis_host or os.environ.get("REDIS_HOST", "redis")
+        self.redis_port = int(redis_port or os.environ.get("REDIS_PORT", 6379))
+
+        # Regex for sniffing Git branch checkout/creation
+        self._branch_regex = re.compile(
+            r'(?:git\s+checkout\s+(?:-b\s+)?|git\s+switch\s+(?:-c\s+)?|git\s+branch\s+)([a-zA-Z0-9_\-\.\/]+)',
+            re.IGNORECASE
+        )
+
+    def _get_connection(self) -> sqlite3.Connection:
+        """Returns a thread-safe connection configured with WAL mode."""
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=5000;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        return conn
+
+    @staticmethod
+    def _hash_payload(payload: Any) -> str:
+        """Computes deterministic SHA-256 hash in memory. Raw payload is never persisted."""
+        if payload is None:
+            return hashlib.sha256(b"").hexdigest()
+        if isinstance(payload, str):
+            p_bytes = payload.encode("utf-8", errors="replace")
+        elif isinstance(payload, (bytes, bytearray)):
+            p_bytes = bytes(payload)
+        else:
+            try:
+                p_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8", errors="replace")
+            except Exception:
+                p_bytes = str(payload).encode("utf-8", errors="replace")
+        return hashlib.sha256(p_bytes).hexdigest()
+
+    def _derive_task_id(self, key_alias: str, messages: Optional[List[Dict[str, Any]]]) -> Optional[str]:
+        """
+        Derives deterministic task_id via Root-Prompt Tree Invariance formula:
+        TaskDigest = SHA-256(KeyAlias + "::" + root_user_prompt[:500])
+        task_id = "task_" + TaskDigest[:16]
+        """
+        if not messages or not isinstance(messages, list):
+            return None
+
+        # Locate root user prompt (first user message)
+        root_content = None
+        for msg in messages:
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                content = msg.get("content")
+                if isinstance(content, str):
+                    root_content = content.strip()
+                    break
+                elif isinstance(content, list):
+                    # Multimodal / structured content
+                    text_parts = [p.get("text", "") for p in content if isinstance(p, dict) and "text" in p]
+                    root_content = " ".join(text_parts).strip()
+                    break
+
+        if not root_content:
+            # Fallback to the first message if no explicit user role found
+            first_msg = messages[0] if messages else {}
+            root_content = str(first_msg.get("content", ""))[:500]
+
+        digest_input = f"{key_alias}::{root_content[:500]}".encode("utf-8", errors="replace")
+        task_digest = hashlib.sha256(digest_input).hexdigest()
+        return f"task_{task_digest[:16]}"
+
+    def _sniff_and_index_branch(self, messages: Any, tool_calls: Any, task_id: str):
+        """
+        Sniffs in-flight Git branch names in RAM, computes SHA-256, and stores
+        bhash:<sha256> -> task_id in Redis with 7-day TTL.
+        Zero cleartext branch names are persisted in Redis.
+        """
+        if not task_id:
+            return
+
+        detected_branch = None
+
+        # 1. Search tool_calls
+        if tool_calls:
+            calls_str = json.dumps(tool_calls) if not isinstance(tool_calls, str) else tool_calls
+            match = self._branch_regex.search(calls_str)
+            if match:
+                detected_branch = match.group(1)
+
+        # 2. Search recent messages if not found in tool_calls
+        if not detected_branch and isinstance(messages, list):
+            for msg in reversed(messages):
+                if isinstance(msg, dict):
+                    content = str(msg.get("content", ""))
+                    match = self._branch_regex.search(content)
+                    if match:
+                        detected_branch = match.group(1)
+                        break
+
+        if detected_branch:
+            # Strip trailing quotes or semicolons
+            detected_branch = detected_branch.strip("'\";,)")
+            bhash = hashlib.sha256(detected_branch.encode("utf-8")).hexdigest()
+            self._write_redis_bhash(bhash, task_id)
+
+    def _write_redis_bhash(self, bhash: str, task_id: str, ttl_seconds: int = 604800):
+        """Stores bhash:<sha256> -> task_id in Redis via direct TCP socket protocol."""
+        key = f"bhash:{bhash}"
+        # RESP command: SET key value EX ttl
+        cmd = f"*5\r\n$3\r\nSET\r\n${len(key)}\r\n{key}\r\n${len(task_id)}\r\n{task_id}\r\n$2\r\nEX\r\n${len(str(ttl_seconds))}\r\n{ttl_seconds}\r\n".encode("utf-8")
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1.0)
+            s.connect((self.redis_host, self.redis_port))
+            s.sendall(cmd)
+            resp = s.recv(1024).decode("utf-8", errors="ignore")
+            s.close()
+            if "+OK" in resp:
+                # Successfully indexed in Redis
+                pass
+        except Exception as e:
+            # Graceful degraded operation: logging continues even if Redis is unreachable
+            print(f"[!] ZDRAuditLogger: Redis bhash index notice: {e}", file=sys.stderr)
+
+    def _calculate_cost(self, model: str, prompt_tokens: int, completion_tokens: int) -> float:
+        """Computes micro-cent costs based on local baseline rate card."""
+        m = (model or "").lower().replace(".", "-")
+        if "mock" in m:
+            p_cost, c_cost = (0.00, 0.00)
+        elif "gpt-4o-mini" in m:
+            p_cost, c_cost = (0.15, 0.60)
+        elif "gpt-4o" in m:
+            p_cost, c_cost = (2.50, 10.00)
+        elif "claude-3-5-sonnet" in m or "sonnet" in m:
+            p_cost, c_cost = (3.00, 15.00)
+        else:
+            p_cost, c_cost = (2.50, 10.00)
+
+        cost = ((prompt_tokens / 1_000_000.0) * p_cost) + ((completion_tokens / 1_000_000.0) * c_cost)
+        return round(cost, 6)
+
+    def log_success_event(self, kwargs: Dict[str, Any], response_obj: Any, start_time: Any, end_time: Any) -> bool:
+        """Logs successful request metadata into gateway_audit_ledger."""
+        try:
+            litellm_params = kwargs.get("litellm_params", {})
+            model_req = kwargs.get("model") or "gpt-4o"
+            model_routed = litellm_params.get("model") or model_req
+            fallback_triggered = 1 if model_req != model_routed else 0
+
+            meta = {**kwargs.get("metadata", {}), **litellm_params.get("metadata", {}), **kwargs.get("litellm_metadata", {})}
+            key_alias = meta.get("user_api_key_alias") or meta.get("key_alias") or kwargs.get("user") or "sk-agent-developer"
+            caller_role = meta.get("role") or meta.get("user_role") or "developer"
+            trace_id = meta.get("trace_id") or f"trace-{uuid.uuid4().hex[:16]}"
+
+            # 1. Ephemeral cryptographic hash of input prompt
+            messages = kwargs.get("messages")
+            prompt_sha256 = self._hash_payload(messages)
+
+            # 2. Ephemeral cryptographic hash of model output (and extract tool_calls for branch sniffing)
+            content = ""
+            tool_calls = None
+            if response_obj and hasattr(response_obj, "choices") and response_obj.choices:
+                choice = response_obj.choices[0]
+                msg = getattr(choice, "message", None) or getattr(choice, "delta", None)
+                if msg:
+                    content = getattr(msg, "content", "") or ""
+                    tool_calls = getattr(msg, "tool_calls", None)
+            elif isinstance(response_obj, dict):
+                choices = response_obj.get("choices", [])
+                if choices:
+                    msg = choices[0].get("message") or choices[0].get("delta") or {}
+                    content = msg.get("content") or ""
+                    tool_calls = msg.get("tool_calls")
+            
+            completion_payload = content if not tool_calls else {"content": content, "tool_calls": tool_calls}
+            completion_sha256 = self._hash_payload(completion_payload)
+
+            # 3. Token usage extraction
+            prompt_tokens, completion_tokens = 0, 0
+            if response_obj and hasattr(response_obj, "usage") and response_obj.usage:
+                u = response_obj.usage
+                prompt_tokens = getattr(u, "prompt_tokens", 0) or 0
+                completion_tokens = getattr(u, "completion_tokens", 0) or 0
+            elif isinstance(response_obj, dict) and "usage" in response_obj:
+                u = response_obj["usage"]
+                prompt_tokens = u.get("prompt_tokens", 0) or 0
+                completion_tokens = u.get("completion_tokens", 0) or 0
+
+            # Use LiteLLM reported cost if available, otherwise calculate
+            reported_cost = kwargs.get("response_cost")
+            if reported_cost is not None and reported_cost > 0:
+                cost_usd = round(float(reported_cost), 6)
+            else:
+                cost_usd = self._calculate_cost(model_routed, prompt_tokens, completion_tokens)
+
+            # 4. Latency calculation
+            if hasattr(start_time, "timestamp") and hasattr(end_time, "timestamp"):
+                latency_ms = round((end_time.timestamp() - start_time.timestamp()) * 1000.0, 2)
+            else:
+                latency_ms = round((float(end_time) - float(start_time)) * 1000.0, 2)
+
+            req_id = (
+                getattr(response_obj, "id", None)
+                or (response_obj.get("id") if isinstance(response_obj, dict) else None)
+                or f"req-{uuid.uuid4().hex[:12]}"
+            )
+
+            # 5. Zero-Touch Task ID Derivation & Branch Sniffing
+            task_id = self._derive_task_id(key_alias, messages)
+            self._sniff_and_index_branch(messages, tool_calls, task_id)
+
+            # 6. Insert metadata into SQLite gateway_audit_ledger
+            conn = self._get_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO gateway_audit_ledger (
+                    request_id, trace_id, api_key_alias, caller_role,
+                    model_requested, model_routed, fallback_triggered,
+                    http_status, latency_ms, prompt_tokens, completion_tokens,
+                    cost_usd, prompt_sha256, completion_sha256, zdr_verified,
+                    task_id, task_outcome
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'pending')
+            """, (
+                req_id, trace_id, key_alias, caller_role,
+                model_req, model_routed, fallback_triggered,
+                200, latency_ms, prompt_tokens, completion_tokens,
+                cost_usd, prompt_sha256, completion_sha256,
+                task_id
+            ))
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            print(f"[!] ZDRAuditLogger Error in log_success_event: {e}", file=sys.stderr)
+            return False
+
+    def log_failure_event(self, kwargs: Dict[str, Any], response_obj: Any, start_time: Any, end_time: Any, error: Optional[str] = None, http_status: Optional[int] = None) -> bool:
+        """Logs failed/rejected request metadata into gateway_audit_ledger."""
+        try:
+            litellm_params = kwargs.get("litellm_params", {})
+            model_req = kwargs.get("model") or "unknown"
+            model_routed = litellm_params.get("model") or model_req
+
+            meta = {**kwargs.get("metadata", {}), **litellm_params.get("metadata", {}), **kwargs.get("litellm_metadata", {})}
+            key_alias = meta.get("user_api_key_alias") or meta.get("key_alias") or kwargs.get("user") or "unknown"
+            caller_role = meta.get("role") or meta.get("user_role") or "developer"
+            trace_id = meta.get("trace_id") or f"trace-{uuid.uuid4().hex[:16]}"
+
+            messages = kwargs.get("messages")
+            prompt_sha256 = self._hash_payload(messages)
+            completion_sha256 = self._hash_payload("")
+
+            status = http_status
+            if status is None:
+                if isinstance(response_obj, Exception):
+                    status = getattr(response_obj, "status_code", None) or getattr(response_obj, "http_status", None) or 500
+                elif isinstance(response_obj, dict):
+                    status = response_obj.get("status_code") or 500
+                else:
+                    status = 500
+
+            if hasattr(start_time, "timestamp") and hasattr(end_time, "timestamp"):
+                latency_ms = round((end_time.timestamp() - start_time.timestamp()) * 1000.0, 2)
+            else:
+                latency_ms = round((float(end_time) - float(start_time)) * 1000.0, 2)
+
+            req_id = f"req-{uuid.uuid4().hex[:12]}"
+            task_id = self._derive_task_id(key_alias, messages)
+
+            conn = self._get_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO gateway_audit_ledger (
+                    request_id, trace_id, api_key_alias, caller_role,
+                    model_requested, model_routed, fallback_triggered,
+                    http_status, latency_ms, prompt_tokens, completion_tokens,
+                    cost_usd, prompt_sha256, completion_sha256, zdr_verified,
+                    task_id, task_outcome
+                ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, 0, 0, 0.0, ?, ?, 1, ?, 'failed')
+            """, (
+                req_id, trace_id, key_alias, caller_role,
+                model_req, model_routed, status, latency_ms,
+                prompt_sha256, completion_sha256, task_id
+            ))
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            print(f"[!] ZDRAuditLogger Error in log_failure_event: {e}", file=sys.stderr)
+            return False
+
+    async def async_log_success_event(self, kwargs: Dict[str, Any], response_obj: Any, start_time: Any, end_time: Any):
+        """Asynchronous hook for LiteLLM async pipelines."""
+        return self.log_success_event(kwargs, response_obj, start_time, end_time)
+
+    async def async_log_failure_event(self, kwargs: Dict[str, Any], response_obj: Any, start_time: Any, end_time: Any):
+        """Asynchronous hook for LiteLLM async failure pipelines."""
+        return self.log_failure_event(kwargs, response_obj, start_time, end_time)
+
+
+# Export singleton instances for LiteLLM Proxy dynamic loading
+zdr_logger = ZDRAuditLogger()
+zdr_audit_logger = zdr_logger

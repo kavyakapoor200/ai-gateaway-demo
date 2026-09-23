@@ -1,0 +1,73 @@
+version: '3.8'
+
+services:
+  # ----------------------------------------------------------------------------
+  # 1. LiteLLM Core AI Gateway Proxy
+  # ----------------------------------------------------------------------------
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    container_name: litellm_gateway
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-enterprise-master-secret-key-2026}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - LITELLM_OTEL_V2=true
+    volumes:
+      - ./litellm_config.yaml:/app/config.yaml
+      - ./custom_zdr_logger.py:/app/custom_zdr_logger.py # In-RAM ZDR logger & branch sniffer
+      - ./gateway.db:/app/gateway.db                     # Embedded SQLite ledger
+    command: ["--config", "/app/config.yaml", "--port", "4000", "--num_workers", "2"]
+    depends_on:
+      - redis
+      - jaeger
+
+  # ----------------------------------------------------------------------------
+  # 2. Redis 7 (Rate Limiting, Real-Time Budgets & Hashed Branch Registry)
+  # ----------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: gateway_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+  # ----------------------------------------------------------------------------
+  # 3. Jaeger All-in-One (OTel Trace Collector & Flow UI)
+  # ----------------------------------------------------------------------------
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: gateway_jaeger
+    restart: unless-stopped
+    ports:
+      - "16686:16686" # Web UI (http://localhost:16686)
+      - "4317:4317"   # OTLP gRPC receiver
+      - "4318:4318"   # OTLP HTTP receiver
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+
+  # ----------------------------------------------------------------------------
+  # 4. CPS Git Merge Lifecycle Webhook Service
+  # ----------------------------------------------------------------------------
+  cps_webhook:
+    image: python:3.11-slim
+    container_name: gateway_cps_webhook
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - ./cps_webhook_server.py:/app/cps_webhook_server.py
+      - ./gateway.db:/app/gateway.db
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - DB_PATH=/app/gateway.db
+      - WEBHOOK_PORT=4001
+    command: ["python", "-u", "cps_webhook_server.py"]
+    ports:
+      - "4001:4001"
+    depends_on:
+      - redis

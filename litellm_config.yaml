@@ -1,0 +1,65 @@
+# ==============================================================================
+# Minimal Local AI Gateway: LiteLLM Configuration
+# ==============================================================================
+
+model_list:
+  # Primary Frontier Model (OpenAI Direct)
+  - model_name: gpt-4o
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: os.environ/OPENAI_API_KEY
+      rpm: 30
+      tpm: 60000
+
+  # Automatic Failover Model (Anthropic Direct)
+  - model_name: claude-3-5-sonnet
+    litellm_params:
+      model: anthropic/claude-3-5-sonnet-20241022
+      api_key: os.environ/ANTHROPIC_API_KEY
+      rpm: 30
+      tpm: 60000
+
+  # Fast / Economical Model (For Intern Role)
+  - model_name: gpt-4o-mini
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+      rpm: 100
+      tpm: 120000
+
+  # Offline Mock Model (For zero-cost testing)
+  - model_name: mock-model
+    litellm_params:
+      model: openai/mock-model
+      api_base: http://host.docker.internal:8080/v1
+      api_key: sk-mock-key
+
+# Fallback Routing Rule: If gpt-4o fails (429/500), automatically route to claude-3-5-sonnet
+router_settings:
+  routing_strategy: latency-based-routing
+  redis_host: "redis"
+  redis_port: 6379
+  fallbacks:
+    - gpt-4o: ["claude-3-5-sonnet", "mock-model"]
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: "sqlite:////app/gateway.db"
+  store_model_in_db: false
+  
+  # Distributed Tracing via OpenTelemetry to local Jaeger & Custom ZDR SQLite Logger
+  callbacks: ["otel", "custom_zdr_logger.zdr_audit_logger"]
+  otel_exporter: "otlp_grpc"
+  otel_endpoint: "http://jaeger:4317"
+
+# Zero Data Retention & Native Guardrails
+litellm_settings:
+  turn_off_message_logging: true
+  
+  # Native PII & Secret Redaction Regexes
+  guardrails:
+    - prompt_regex:
+        - "(?i)(AKIA[0-9A-Z]{16})"               # AWS Access Keys
+        - "(?i)(sk-[a-zA-Z0-9]{32,})"            # API Keys
+        - "[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\\.[a-zA-Z0-9-.]+" # Emails
+      mode: "mask" # Automatically replaced with [REDACTED]

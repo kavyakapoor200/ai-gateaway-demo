@@ -4,7 +4,7 @@
 # ==============================================================================
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 MASTER_KEY="${LITELLM_MASTER_KEY:-sk-enterprise-master-secret-key-2026}"
@@ -41,7 +41,7 @@ start_docker() {
     # Wait for LiteLLM to respond
     local retries=40
     local count=0
-    until curl -s "$GATEWAY_URL/health" >/dev/null 2>&1 || [ "$count" -ge "$retries" ]; do
+    until curl -s "$GATEWAY_URL/health/liveliness" >/dev/null 2>&1 || [ "$count" -ge "$retries" ]; do
         sleep 2
         count=$((count + 1))
         printf "."
@@ -141,7 +141,7 @@ show_summary() {
     echo ""
     echo "2. Test RBAC Rejection (Intern attempting prohibited model):"
     echo "   curl -i -X POST $GATEWAY_URL/v1/chat/completions \\"
-    echo "     -H 'Authorization: Bearer sk-agent-intern' \\"
+    echo "     -H 'Authorization: Bearer sk-agent-intern-poc' \\"
     echo "     -H 'Content-Type: application/json' \\"
     echo "     -d '{\"model\": \"gpt-4o\", \"messages\": [{\"role\": \"user\", \"content\": \"Hello\"}]}'"
     echo "=============================================================================="

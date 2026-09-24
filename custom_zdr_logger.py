@@ -105,12 +105,32 @@ class ZDRAuditLogger(CustomLogger):
                 p_bytes = str(payload).encode("utf-8", errors="replace")
         return hashlib.sha256(p_bytes).hexdigest()
 
-    def _derive_task_id(self, key_alias: str, messages: Optional[List[Dict[str, Any]]]) -> Optional[str]:
+    @staticmethod
+    def derive_task_id_from_pr(branch_or_ref: str) -> str:
+        """
+        Derives deterministic task_id directly from the cryptographic SHA-256
+        hash of the Git branch/PR identity:
+        task_id = "task_pr_" + SHA256(branch)[:12]
+        """
+        if not branch_or_ref:
+            return "task_pr_unknown"
+        clean_branch = branch_or_ref.strip()
+        if clean_branch.startswith("refs/heads/"):
+            clean_branch = clean_branch[len("refs/heads/"):]
+        bhash = hashlib.sha256(clean_branch.encode("utf-8")).hexdigest()
+        return f"task_pr_{bhash[:12]}"
+
+    def _derive_task_id(self, key_alias: str, messages: Optional[List[Dict[str, Any]]], branch_name: Optional[str] = None) -> Optional[str]:
         """
         Derives deterministic task_id via Root-Prompt Tree Invariance formula:
         TaskDigest = SHA-256(KeyAlias + "::" + root_user_prompt[:500])
         task_id = "task_" + TaskDigest[:16]
+        
+        If branch_name is provided, can also derive task_id directly from the hashed PR identity.
         """
+        if branch_name:
+            return self.derive_task_id_from_pr(branch_name)
+
         if not messages or not isinstance(messages, list):
             return None
 
@@ -148,26 +168,34 @@ class ZDRAuditLogger(CustomLogger):
 
         detected_branch = None
 
-        # 1. Search tool_calls
+        # 1. Search direct tool_calls parameter
         if tool_calls:
             calls_str = json.dumps(tool_calls) if not isinstance(tool_calls, str) else tool_calls
             match = self._branch_regex.search(calls_str)
             if match:
                 detected_branch = match.group(1)
 
-        # 2. Search recent messages if not found in tool_calls
+        # 2. Search message history (both content and embedded tool_calls)
         if not detected_branch and isinstance(messages, list):
             for msg in reversed(messages):
                 if isinstance(msg, dict):
-                    content = str(msg.get("content", ""))
-                    match = self._branch_regex.search(content)
-                    if match:
-                        detected_branch = match.group(1)
+                    # Check msg tool_calls
+                    if "tool_calls" in msg and msg["tool_calls"]:
+                        tc_str = json.dumps(msg["tool_calls"])
+                        m = self._branch_regex.search(tc_str)
+                        if m:
+                            detected_branch = m.group(1)
+                            break
+                    # Check serialized message text
+                    m_str = json.dumps(msg)
+                    m = self._branch_regex.search(m_str)
+                    if m:
+                        detected_branch = m.group(1)
                         break
 
         if detected_branch:
-            # Strip trailing quotes or semicolons
-            detected_branch = detected_branch.strip("'\";,)")
+            # Strip trailing quotes or semicolons or braces
+            detected_branch = detected_branch.strip("'\";,)} \n\r\t")
             bhash = hashlib.sha256(detected_branch.encode("utf-8")).hexdigest()
             self._write_redis_bhash(bhash, task_id)
 

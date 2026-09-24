@@ -9,14 +9,25 @@ import json
 import hashlib
 import sqlite3
 import socket
+from typing import Optional
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", 6379))
-DB_PATH = os.environ.get("DB_PATH", "gateway.db")
 PORT = int(os.environ.get("WEBHOOK_PORT", 4001))
 
-def query_redis_branch(branch_name: str) -> str:
+def get_db_path() -> str:
+    if os.environ.get("DB_PATH"):
+        return os.environ.get("DB_PATH")
+    if os.path.exists("data/gateway.db"):
+        return "data/gateway.db"
+    if os.path.exists("/app/data/gateway.db"):
+        return "/app/data/gateway.db"
+    if os.path.exists("gateway.db"):
+        return "gateway.db"
+    return "data/gateway.db"
+
+def query_redis_branch(branch_name: str) -> Optional[str]:
     """Queries Redis directly via socket / RESP protocol for bhash:<sha256>."""
     bhash = hashlib.sha256(branch_name.encode("utf-8")).hexdigest()
     key = f"bhash:{bhash}"
@@ -56,21 +67,48 @@ class WebhookHandler(BaseHTTPRequestHandler):
             
             task_id = query_redis_branch(branch) if branch else None
             new_status = "verified_success" if merged else "unmerged_closed"
+            bhash = hashlib.sha256(branch.encode("utf-8")).hexdigest() if branch else ""
+            db_path = get_db_path()
+            updated_rows = 0
+
+            # Fallback check if task_id was directly derived from hashed PR identity
+            if not task_id and branch:
+                candidate_ids = [f"task_{bhash[:16]}", f"task_pr_{bhash[:12]}"]
+                try:
+                    conn = sqlite3.connect(db_path, timeout=10.0)
+                    conn.execute("PRAGMA journal_mode=WAL;")
+                    for cid in candidate_ids:
+                        cur = conn.cursor()
+                        cur.execute("SELECT task_id FROM gateway_audit_ledger WHERE task_id = ? LIMIT 1", (cid,))
+                        if cur.fetchone():
+                            task_id = cid
+                            break
+                    conn.close()
+                except Exception as e:
+                    print(f"[!] Direct PR hash lookup error: {e}", file=sys.stderr)
             
             if task_id:
                 try:
-                    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+                    conn = sqlite3.connect(db_path, timeout=10.0)
                     conn.execute("PRAGMA journal_mode=WAL;")
-                    conn.execute("UPDATE gateway_audit_ledger SET task_outcome = ? WHERE task_id = ?", (new_status, task_id))
+                    cur = conn.cursor()
+                    cur.execute("UPDATE gateway_audit_ledger SET task_outcome = ? WHERE task_id = ?", (new_status, task_id))
+                    updated_rows = cur.rowcount
                     conn.commit()
                     conn.close()
-                    print(f"✅ Reconciled task {task_id} -> {new_status} for branch '{branch}'")
+                    print(f"✅ Reconciled task {task_id} -> {new_status} (bhash: {bhash[:16]}..., rows: {updated_rows})")
                 except Exception as e:
                     print(f"[!] SQLite update error: {e}", file=sys.stderr)
             else:
-                print(f"⚠️ No active task found in Redis for branch '{branch}'")
+                print(f"⚠️ No active task found in Redis or SQLite for branch '{branch}' (bhash: {bhash[:16]}...)")
             
-            response_data = {"status": "ok", "task_id": task_id, "branch": branch, "outcome": new_status}
+            response_data = {
+                "status": "ok",
+                "task_id": task_id,
+                "branch_hash": bhash,
+                "outcome": new_status,
+                "updated_rows": updated_rows
+            }
             body = json.dumps(response_data).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")

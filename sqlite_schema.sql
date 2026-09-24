@@ -1,7 +1,18 @@
 -- =============================================================================
--- Minimal Local AI Gateway: Single-Table SQLite Ledger
+-- Minimal Local AI Gateway: Single-Table SQLite Ledger & Analytical Views
+-- Compliant with SUB-POC-02: SQLite Ledger, Observability & Cryptographic ZDR
 -- =============================================================================
 
+-- WAL Concurrency & Performance PRAGMAs
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+PRAGMA busy_timeout = 5000;
+PRAGMA cache_size = -64000; -- 64MB cache
+PRAGMA foreign_keys = ON;
+
+-- -----------------------------------------------------------------------------
+-- Single-Table Audit & CPS Ledger
+-- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS gateway_audit_ledger (
     request_id TEXT PRIMARY KEY,
     trace_id TEXT NOT NULL,
@@ -39,7 +50,9 @@ CREATE INDEX IF NOT EXISTS idx_trace_id ON gateway_audit_ledger(trace_id);
 CREATE INDEX IF NOT EXISTS idx_task_id ON gateway_audit_ledger(task_id);
 CREATE INDEX IF NOT EXISTS idx_created_at ON gateway_audit_ledger(created_at);
 
--- Real-Time Coding CPS Summary View
+-- -----------------------------------------------------------------------------
+-- Analytical View: Real-Time Coding CPS Summary
+-- -----------------------------------------------------------------------------
 CREATE VIEW IF NOT EXISTS v_coding_cps_summary AS
 SELECT 
     task_id,
@@ -55,7 +68,9 @@ FROM gateway_audit_ledger
 WHERE task_id IS NOT NULL
 GROUP BY task_id, task_outcome;
 
--- Automated ZDR Compliance Audit View
+-- -----------------------------------------------------------------------------
+-- Analytical View: Automated ZDR Compliance Audit
+-- -----------------------------------------------------------------------------
 CREATE VIEW IF NOT EXISTS v_zdr_compliance_check AS
 SELECT 
     COUNT(*) AS total_records,
@@ -63,6 +78,7 @@ SELECT
     SUM(CASE WHEN LENGTH(completion_sha256) = 64 AND completion_sha256 GLOB '[0-9a-f]*' THEN 1 ELSE 0 END) AS valid_completion_hashes,
     SUM(CASE WHEN zdr_verified = 1 THEN 1 ELSE 0 END) AS zdr_flags_valid,
     CASE 
+        WHEN COUNT(*) = 0 THEN 'NO RECORDS YET'
         WHEN COUNT(*) = SUM(CASE WHEN LENGTH(prompt_sha256) = 64 AND prompt_sha256 GLOB '[0-9a-f]*' THEN 1 ELSE 0 END)
          AND COUNT(*) = SUM(CASE WHEN LENGTH(completion_sha256) = 64 AND completion_sha256 GLOB '[0-9a-f]*' THEN 1 ELSE 0 END)
         THEN '100% COMPLIANT - ZERO PLAINTEXT DETECTED'

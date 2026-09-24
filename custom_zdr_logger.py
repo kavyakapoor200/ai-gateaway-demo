@@ -42,12 +42,21 @@ class ZDRAuditLogger(CustomLogger):
             self.db_path = db_path
         elif os.environ.get("DB_PATH"):
             self.db_path = os.environ.get("DB_PATH")
+        elif os.path.exists("/app/data"):
+            self.db_path = "/app/data/gateway.db"
+        elif os.path.exists("data"):
+            self.db_path = "data/gateway.db"
         elif os.path.exists("/app"):
             self.db_path = "/app/gateway.db"
         else:
             self.db_path = "gateway.db"
 
-        self.redis_host = redis_host or os.environ.get("REDIS_HOST", "redis")
+        # Ensure directory exists
+        db_dir = os.path.dirname(os.path.abspath(self.db_path))
+        if db_dir and not os.path.exists(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
+
+        self.redis_host = redis_host or os.environ.get("REDIS_HOST", "localhost")
         self.redis_port = int(redis_port or os.environ.get("REDIS_PORT", 6379))
 
         # Regex for sniffing Git branch checkout/creation
@@ -55,6 +64,22 @@ class ZDRAuditLogger(CustomLogger):
             r'(?:git\s+checkout\s+(?:-b\s+)?|git\s+switch\s+(?:-c\s+)?|git\s+branch\s+)([a-zA-Z0-9_\-\.\/]+)',
             re.IGNORECASE
         )
+        self._ensure_schema()
+
+    def _ensure_schema(self):
+        """Ensures gateway_audit_ledger and analytical views exist."""
+        try:
+            conn = self._get_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='gateway_audit_ledger';")
+            if not cur.fetchone():
+                schema_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sqlite_schema.sql")
+                if os.path.exists(schema_path):
+                    with open(schema_path, "r") as f:
+                        conn.executescript(f.read())
+            conn.close()
+        except Exception as e:
+            print(f"[!] ZDRAuditLogger: Schema bootstrap notice: {e}", file=sys.stderr)
 
     def _get_connection(self) -> sqlite3.Connection:
         """Returns a thread-safe connection configured with WAL mode."""
@@ -256,7 +281,7 @@ class ZDRAuditLogger(CustomLogger):
             conn = self._get_connection()
             cur = conn.cursor()
             cur.execute("""
-                INSERT INTO gateway_audit_ledger (
+                INSERT OR REPLACE INTO gateway_audit_ledger (
                     request_id, trace_id, api_key_alias, caller_role,
                     model_requested, model_routed, fallback_triggered,
                     http_status, latency_ms, prompt_tokens, completion_tokens,
@@ -313,7 +338,7 @@ class ZDRAuditLogger(CustomLogger):
             conn = self._get_connection()
             cur = conn.cursor()
             cur.execute("""
-                INSERT INTO gateway_audit_ledger (
+                INSERT OR REPLACE INTO gateway_audit_ledger (
                     request_id, trace_id, api_key_alias, caller_role,
                     model_requested, model_routed, fallback_triggered,
                     http_status, latency_ms, prompt_tokens, completion_tokens,

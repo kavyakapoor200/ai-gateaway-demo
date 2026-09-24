@@ -11,13 +11,61 @@ model_list:
       rpm: 30
       tpm: 60000
 
-  # Automatic Failover Model (Anthropic Direct)
+  # Claude Models -> Routed 100% to Local Ollama Models
   - model_name: claude-3-5-sonnet
     litellm_params:
-      model: anthropic/claude-3-5-sonnet-20241022
-      api_key: os.environ/ANTHROPIC_API_KEY
-      rpm: 30
-      tpm: 60000
+      model: ollama_chat/qwen3.5:9b-mlx
+      api_base: http://host.docker.internal:11434
+
+  - model_name: claude-3-5-sonnet-20241022
+    litellm_params:
+      model: ollama_chat/qwen3.5:9b-mlx
+      api_base: http://host.docker.internal:11434
+
+  - model_name: claude-3-5-sonnet-latest
+    litellm_params:
+      model: ollama_chat/qwen3.5:9b-mlx
+      api_base: http://host.docker.internal:11434
+      
+
+  - model_name: claude-3-7-sonnet
+    litellm_params:
+      model: ollama_chat/qwen3.5:9b-mlx
+      api_base: http://host.docker.internal:11434
+
+  - model_name: claude-3-7-sonnet-20250219
+    litellm_params:
+      model: ollama_chat/qwen3.5:9b-mlx
+      api_base: http://host.docker.internal:11434
+      input_cost_per_token: 0.0001
+      output_cost_per_token: 0.0002
+
+  - model_name: claude-3-opus-20240229
+    litellm_params:
+      model: ollama_chat/qwen3.5:9b-mlx
+      api_base: http://host.docker.internal:11434
+
+  - model_name: claude-3-5-haiku
+    litellm_params:
+      model: ollama_chat/qwen3.5:4b-mlx
+      api_base: http://host.docker.internal:11434
+      input_cost_per_token: 0.0001
+      output_cost_per_token: 0.0002
+
+  - model_name: claude-3-5-haiku-20241022
+    litellm_params:
+      model: ollama_chat/qwen3.5:4b-mlx
+      api_base: http://host.docker.internal:11434
+
+  - model_name: claude-3-haiku-20240307
+    litellm_params:
+      model: ollama_chat/qwen3.5:4b-mlx
+      api_base: http://host.docker.internal:11434
+
+  - model_name: "claude/*"
+    litellm_params:
+      model: ollama_chat/qwen3.5:9b-mlx
+      api_base: http://host.docker.internal:11434
 
   # Fast / Economical Model (For Intern Role)
   - model_name: gpt-4o-mini
@@ -36,6 +84,32 @@ model_list:
       input_cost_per_token: 0.0001
       output_cost_per_token: 0.0002
 
+  # Local Ollama Models (via Host Gateway)
+  - model_name: "ollama/*"
+    litellm_params:
+      model: "ollama_chat/*"
+      api_base: http://host.docker.internal:11434
+
+  - model_name: qwen3.5:9b-mlx
+    litellm_params:
+      model: ollama_chat/qwen3.5:9b-mlx
+      api_base: http://host.docker.internal:11434
+
+  - model_name: gemma4:12b-mlx
+    litellm_params:
+      model: ollama_chat/gemma4:12b-mlx
+      api_base: http://host.docker.internal:11434
+
+  - model_name: gemma4:e4b-mlx
+    litellm_params:
+      model: ollama_chat/gemma4:e4b-mlx
+      api_base: http://host.docker.internal:11434
+
+  - model_name: qwen3.5:4b-mlx
+    litellm_params:
+      model: ollama_chat/qwen3.5:4b-mlx
+      api_base: http://host.docker.internal:11434
+
 # Fallback Routing Rule: If gpt-4o fails (429/500), automatically route to claude-3-5-sonnet
 router_settings:
   routing_strategy: latency-based-routing
@@ -43,15 +117,20 @@ router_settings:
   redis_port: 6379
   fallbacks:
     - gpt-4o: ["claude-3-5-sonnet", "mock-model"]
+    - claude-3-5-sonnet: ["mock-model"]
+    - claude-3-5-sonnet-20241022: ["mock-model"]
+    - claude-3-7-sonnet: ["mock-model"]
+    - claude-3-5-haiku: ["mock-model"]
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
   database_url: "postgresql://postgres:postgres@postgres:5432/litellm"
-  store_model_in_db: false
+  store_model_in_db: true
   otel_exporter: "otlp_grpc"
   otel_endpoint: "http://jaeger:4317"
 
-# Zero Data Retention & Custom Callbacks
+# Zero Data Retention, Metrics & Custom Callbacks
 litellm_settings:
   turn_off_message_logging: true
-  callbacks: ["otel", "custom_zdr_logger.zdr_audit_logger"]
+  require_auth_for_metrics_endpoint: false
+  callbacks: ["otel", "prometheus", "custom_zdr_logger.zdr_audit_logger"]

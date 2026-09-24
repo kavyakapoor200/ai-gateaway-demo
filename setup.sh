@@ -67,7 +67,7 @@ provision_keys() {
       -d '{
         "key": "sk-agent-developer",
         "key_alias": "sk-agent-developer",
-        "models": ["gpt-4o", "claude-3-5-sonnet", "mock-model"],
+        "models": ["gpt-4o", "claude-3-5-sonnet", "mock-model", "qwen3.5:9b-mlx", "gemma4:12b-mlx", "gemma4:e4b-mlx", "qwen3.5:4b-mlx", "ollama/*"],
         "max_budget": 5.0,
         "rpm_limit": 30,
         "duration": "1d",

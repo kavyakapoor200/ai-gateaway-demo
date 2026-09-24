@@ -847,6 +847,31 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif self.path in ("/metrics", "/metrics/"):
+            stats = get_db_stats()
+            prom_lines = [
+                "# HELP ai_gateway_tasks_total Total coding tasks recorded by gateway",
+                "# TYPE ai_gateway_tasks_total gauge",
+                f"ai_gateway_tasks_total {stats.get('total_tasks', 0)}",
+                "# HELP ai_gateway_verified_success_tasks_total Reconciled successful tasks via PR merge",
+                "# TYPE ai_gateway_verified_success_tasks_total gauge",
+                f"ai_gateway_verified_success_tasks_total {stats.get('verified_tasks', 0)}",
+                "# HELP ai_gateway_total_spend_usd Cumulative gateway token spend in USD",
+                "# TYPE ai_gateway_total_spend_usd gauge",
+                f"ai_gateway_total_spend_usd {stats.get('total_spend', 0.0)}",
+                "# HELP ai_gateway_avg_cps_usd Average Cost Per Successful Task (CPS) in USD",
+                "# TYPE ai_gateway_avg_cps_usd gauge",
+                f"ai_gateway_avg_cps_usd {stats.get('avg_cps', 0.0)}",
+                "# HELP ai_gateway_zdr_compliant Zero Data Retention Invariant Compliance (1 = 100% compliant)",
+                "# TYPE ai_gateway_zdr_compliant gauge",
+                f"ai_gateway_zdr_compliant {1 if '100%' in stats.get('zdr_status', '') else 0}"
+            ]
+            prom_body = ("\n".join(prom_lines) + "\n").encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+            self.send_header("Content-Length", str(len(prom_body)))
+            self.end_headers()
+            self.wfile.write(prom_body)
         else:
             self.send_response(404)
             self.end_headers()

@@ -23,6 +23,8 @@ services:
       - OTEL_SERVICE_NAME=litellm
       - OTEL_BSP_SCHEDULE_DELAY_MILLIS=500
       - DB_PATH=/app/data/gateway.db
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - gateway_data:/app/data
     command: ["--config", "/app/config.yaml", "--port", "4000", "--num_workers", "2"]
@@ -109,6 +111,42 @@ services:
     ports:
       - "8088:8080"
 
+  # ----------------------------------------------------------------------------
+  # 7. Prometheus (Metrics Scraper & Timeseries Storage)
+  # ----------------------------------------------------------------------------
+  prometheus:
+    build:
+      context: .
+      dockerfile: Dockerfile.prometheus
+    container_name: gateway_prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    depends_on:
+      - litellm
+      - cps_webhook
+
+  # ----------------------------------------------------------------------------
+  # 8. Grafana (Visualization Console)
+  # ----------------------------------------------------------------------------
+  grafana:
+    build:
+      context: .
+      dockerfile: Dockerfile.grafana
+    container_name: gateway_grafana
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+    depends_on:
+      - prometheus
+      - jaeger
+
 volumes:
   pgdata:
   gateway_data:
+

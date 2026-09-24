@@ -350,7 +350,22 @@ class ZDRAuditLogger(CustomLogger):
             meta = {**kwargs.get("metadata", {}), **litellm_params.get("metadata", {}), **kwargs.get("litellm_metadata", {})}
             key_alias = meta.get("_zdr_key_alias") or meta.get("user_api_key_alias") or meta.get("key_alias") or kwargs.get("user") or "sk-agent-developer"
             caller_role = meta.get("role") or meta.get("user_role") or "developer"
-            trace_id = meta.get("trace_id") or f"trace-{uuid.uuid4().hex[:16]}"
+            # Extract active OpenTelemetry trace ID or fallback
+            trace_id = None
+            try:
+                from opentelemetry import trace
+                span = trace.get_current_span()
+                if span and span.get_span_context().is_valid:
+                    trace_id = format(span.get_span_context().trace_id, "032x")
+            except Exception:
+                pass
+            if not trace_id:
+                raw_tid = kwargs.get("litellm_trace_id") or meta.get("litellm_trace_id") or meta.get("trace_id")
+                if raw_tid:
+                    cleaned = str(raw_tid).replace("-", "").lower()
+                    trace_id = cleaned[:32].zfill(32)
+                else:
+                    trace_id = uuid.uuid4().hex
 
             # 1. Ephemeral cryptographic hash of input prompt
             messages = kwargs.get("messages")
@@ -444,7 +459,22 @@ class ZDRAuditLogger(CustomLogger):
             meta = {**kwargs.get("metadata", {}), **litellm_params.get("metadata", {}), **kwargs.get("litellm_metadata", {})}
             key_alias = meta.get("_zdr_key_alias") or meta.get("user_api_key_alias") or meta.get("key_alias") or kwargs.get("user") or "unknown"
             caller_role = meta.get("role") or meta.get("user_role") or "developer"
-            trace_id = meta.get("trace_id") or f"trace-{uuid.uuid4().hex[:16]}"
+            # Extract active OpenTelemetry trace ID or fallback
+            trace_id = None
+            try:
+                from opentelemetry import trace
+                span = trace.get_current_span()
+                if span and span.get_span_context().is_valid:
+                    trace_id = format(span.get_span_context().trace_id, "032x")
+            except Exception:
+                pass
+            if not trace_id:
+                raw_tid = kwargs.get("litellm_trace_id") or meta.get("litellm_trace_id") or meta.get("trace_id")
+                if raw_tid:
+                    cleaned = str(raw_tid).replace("-", "").lower()
+                    trace_id = cleaned[:32].zfill(32)
+                else:
+                    trace_id = uuid.uuid4().hex
 
             messages = kwargs.get("messages")
             prompt_sha256 = meta.get("_zdr_prompt_sha256") or self._hash_payload(messages)

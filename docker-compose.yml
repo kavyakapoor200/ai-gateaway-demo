@@ -18,6 +18,10 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - LITELLM_OTEL_V2=true
+      - OTEL_EXPORTER=otlp_http
+      - OTEL_ENDPOINT=http://jaeger:4318/v1/traces
+      - OTEL_SERVICE_NAME=litellm
+      - OTEL_BSP_SCHEDULE_DELAY_MILLIS=500
       - DB_PATH=/app/data/gateway.db
     volumes:
       - gateway_data:/app/data

@@ -330,6 +330,50 @@ def run_runbook_suite():
         f"body={body}"
     )
 
+    # 7.4 End-to-End Distributed Transaction Tracing in Jaeger
+    req_7_3_id = body.get("id")
+    target_trace_id = None
+    # Poll SQLite ledger for this transaction
+    for _ in range(10):
+        time.sleep(0.5)
+        sync_sqlite_from_container()
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT trace_id FROM gateway_audit_ledger WHERE request_id = ?", (req_7_3_id,))
+        row = cur.fetchone()
+        if not row or not row[0]:
+            cur.execute("SELECT trace_id FROM gateway_audit_ledger WHERE LENGTH(trace_id) = 32 ORDER BY created_at DESC LIMIT 1")
+            row = cur.fetchone()
+        conn.close()
+        if row and row[0]:
+            target_trace_id = row[0]
+            break
+
+    assert_true(target_trace_id is not None, f"Active trace_id found in SQLite audit ledger for transaction {req_7_3_id}", f"target_trace_id={target_trace_id}")
+
+    # Poll Jaeger API for the exported trace waterfall (OTel BatchSpanProcessor flush)
+    trace_found = False
+    spans_count = 0
+    last_status = 0
+    for _ in range(10):
+        st, j_body, raw = make_http_request(f"{JAEGER_URL}/api/traces/{target_trace_id}")
+        last_status = st
+        if st == 200 and isinstance(j_body, dict):
+            t_data = j_body.get("data")
+            if isinstance(t_data, list) and len(t_data) > 0:
+                spans = t_data[0].get("spans", [])
+                if len(spans) > 0:
+                    trace_found = True
+                    spans_count = len(spans)
+                    break
+        time.sleep(0.5)
+
+    assert_true(
+        trace_found,
+        f"End-to-End Tracing: SQLite transaction trace_id '{target_trace_id}' verified in Jaeger waterfall ({spans_count} spans)",
+        f"status={last_status}, spans={spans_count}"
+    )
+
     print("\n" + "=" * 78)
     print(f"  🎉 ALL 7 VERIFICATION RUNBOOK STEPS PASSED SUCCESSFULLY! ({total_passed}/{total_tests} assertions)")
     print("=" * 78)

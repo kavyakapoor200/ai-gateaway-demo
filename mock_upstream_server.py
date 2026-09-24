@@ -7,6 +7,7 @@ Supports both non-streaming and basic streaming completions.
 import sys
 import json
 import time
+import uuid
 import argparse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -41,10 +42,11 @@ class MockOpenAIHandler(BaseHTTPRequestHandler):
                 self.send_header("Connection", "keep-alive")
                 self.end_headers()
 
+                req_id = f"chatcmpl-mock-{uuid.uuid4().hex[:12]}"
                 chunks = ["Mock ", "completion ", "response: ", "Operation ", "successful."]
                 for i, chunk in enumerate(chunks):
                     payload = {
-                        "id": f"chatcmpl-mock-{int(time.time())}",
+                        "id": req_id,
                         "object": "chat.completion.chunk",
                         "created": int(time.time()),
                         "model": model,
@@ -61,7 +63,7 @@ class MockOpenAIHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             else:
                 response = {
-                    "id": f"chatcmpl-mock-{int(time.time())}",
+                    "id": f"chatcmpl-mock-{uuid.uuid4().hex[:12]}",
                     "object": "chat.completion",
                     "created": int(time.time()),
                     "model": model,

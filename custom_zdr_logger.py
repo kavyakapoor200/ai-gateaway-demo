@@ -316,8 +316,23 @@ class ZDRAuditLogger(CustomLogger):
                         content = re.sub(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', '[REDACTED]', content)
                         msg["content"] = content
 
-                key_alias = getattr(user_api_key_dict, "key_alias", None) if user_api_key_dict else None
+                key_alias = None
+                if user_api_key_dict:
+                    if isinstance(user_api_key_dict, dict):
+                        key_alias = user_api_key_dict.get("key_alias") or user_api_key_dict.get("key_name") or user_api_key_dict.get("api_key")
+                    else:
+                        key_alias = getattr(user_api_key_dict, "key_alias", None) or getattr(user_api_key_dict, "key_name", None)
+                if not key_alias:
+                    key_alias = data.get("metadata", {}).get("user_api_key_alias") or data.get("user") or "sk-agent-developer"
+
+                prompt_sha256 = self._hash_payload(messages)
                 task_id = self._derive_task_id(key_alias, messages)
+
+                meta = data.setdefault("metadata", {})
+                meta["_zdr_prompt_sha256"] = prompt_sha256
+                meta["_zdr_task_id"] = task_id
+                meta["_zdr_key_alias"] = key_alias
+
                 tool_calls = data.get("tools") or data.get("tool_calls")
                 self._sniff_and_index_branch(messages, tool_calls, task_id)
         except Exception as e:
@@ -333,13 +348,13 @@ class ZDRAuditLogger(CustomLogger):
             fallback_triggered = 1 if model_req != model_routed else 0
 
             meta = {**kwargs.get("metadata", {}), **litellm_params.get("metadata", {}), **kwargs.get("litellm_metadata", {})}
-            key_alias = meta.get("user_api_key_alias") or meta.get("key_alias") or kwargs.get("user") or "sk-agent-developer"
+            key_alias = meta.get("_zdr_key_alias") or meta.get("user_api_key_alias") or meta.get("key_alias") or kwargs.get("user") or "sk-agent-developer"
             caller_role = meta.get("role") or meta.get("user_role") or "developer"
             trace_id = meta.get("trace_id") or f"trace-{uuid.uuid4().hex[:16]}"
 
             # 1. Ephemeral cryptographic hash of input prompt
             messages = kwargs.get("messages")
-            prompt_sha256 = self._hash_payload(messages)
+            prompt_sha256 = meta.get("_zdr_prompt_sha256") or self._hash_payload(messages)
 
             # 2. Ephemeral cryptographic hash of model output (and extract tool_calls for branch sniffing)
             content = ""
@@ -391,7 +406,7 @@ class ZDRAuditLogger(CustomLogger):
             )
 
             # 5. Zero-Touch Task ID Derivation & Branch Sniffing
-            task_id = self._derive_task_id(key_alias, messages)
+            task_id = meta.get("_zdr_task_id") or self._derive_task_id(key_alias, messages)
             self._sniff_and_index_branch(messages, tool_calls, task_id)
 
             # 6. Insert metadata into SQLite gateway_audit_ledger
@@ -427,13 +442,14 @@ class ZDRAuditLogger(CustomLogger):
             model_routed = litellm_params.get("model") or model_req
 
             meta = {**kwargs.get("metadata", {}), **litellm_params.get("metadata", {}), **kwargs.get("litellm_metadata", {})}
-            key_alias = meta.get("user_api_key_alias") or meta.get("key_alias") or kwargs.get("user") or "unknown"
+            key_alias = meta.get("_zdr_key_alias") or meta.get("user_api_key_alias") or meta.get("key_alias") or kwargs.get("user") or "unknown"
             caller_role = meta.get("role") or meta.get("user_role") or "developer"
             trace_id = meta.get("trace_id") or f"trace-{uuid.uuid4().hex[:16]}"
 
             messages = kwargs.get("messages")
-            prompt_sha256 = self._hash_payload(messages)
+            prompt_sha256 = meta.get("_zdr_prompt_sha256") or self._hash_payload(messages)
             completion_sha256 = self._hash_payload("")
+            task_id = meta.get("_zdr_task_id") or self._derive_task_id(key_alias, messages)
 
             status = http_status
             if status is None:

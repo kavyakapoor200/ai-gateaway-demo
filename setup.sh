@@ -16,13 +16,14 @@ echo "   Minimal Local AI Gateway PoC: Setup & Provisioning"
 echo "=============================================================================="
 
 # 1. Initialize SQLite Database
-echo "📦 [1/4] Initializing SQLite database (gateway.db)..."
+echo "📦 [1/4] Initializing SQLite database (data/gateway.db)..."
+mkdir -p data
 if command -v sqlite3 >/dev/null 2>&1; then
-    sqlite3 gateway.db < sqlite_schema.sql
-    echo "    ✅ Created gateway.db with single-table ledger & analytical views."
+    sqlite3 data/gateway.db < sqlite_schema.sql
+    echo "    ✅ Created data/gateway.db with single-table ledger & analytical views."
 else
     echo "    ⚠️ sqlite3 CLI not found locally. SQLite file will be initialized on first write."
-    touch gateway.db
+    touch data/gateway.db
 fi
 
 # 2. Check / Copy .env
@@ -33,12 +34,12 @@ fi
 
 # 3. Start Docker Compose Stack
 start_docker() {
-    echo "🐳 [2/4] Starting Docker Compose stack (LiteLLM, Redis, Jaeger, CPS Webhook)..."
+    echo "🐳 [2/4] Starting Docker Compose stack (LiteLLM, Postgres, Redis, Jaeger, CPS Webhook, Mock Upstream)..."
     docker compose up -d
     echo "    Waiting for services to become healthy..."
     
     # Wait for LiteLLM to respond
-    local retries=30
+    local retries=40
     local count=0
     until curl -s "$GATEWAY_URL/health" >/dev/null 2>&1 || [ "$count" -ge "$retries" ]; do
         sleep 2
@@ -48,17 +49,17 @@ start_docker() {
     echo ""
 
     if [ "$count" -ge "$retries" ]; then
-        echo "    ⚠️ Gateway did not report ready within 60s. Check 'docker compose logs litellm'."
+        echo "    ⚠️ Gateway did not report ready within 80s. Check 'docker compose logs litellm'."
     else
         echo "    ✅ Gateway is healthy at $GATEWAY_URL"
     fi
 }
 
-# 4. Provision Initial Virtual API Keys
+# 4. Provision Initial Virtual API Keys (RBAC Matrix)
 provision_keys() {
     echo "🔑 [3/4] Provisioning RBAC Virtual API Keys..."
 
-    # Developer Key: gpt-4o, claude-3-5-sonnet, mock-model ($5.00 daily budget)
+    # Developer Key: gpt-4o, claude-3-5-sonnet, mock-model ($5.00 daily budget, 30 RPM)
     echo "    Creating Developer Key ('sk-agent-developer')..."
     curl -s -X POST "$GATEWAY_URL/key/generate" \
       -H "Authorization: Bearer $MASTER_KEY" \
@@ -68,23 +69,54 @@ provision_keys() {
         "key_alias": "sk-agent-developer",
         "models": ["gpt-4o", "claude-3-5-sonnet", "mock-model"],
         "max_budget": 5.0,
+        "rpm_limit": 30,
         "duration": "1d",
         "metadata": {"role": "developer"}
       }' >/dev/null && echo "    ✅ Developer key provisioned." || echo "    ⚠️ Note: Check if key already exists."
 
-    # Intern Key: Restricted to gpt-4o-mini & mock-model ($1.00 daily budget)
-    echo "    Creating Intern Key ('sk-agent-intern')..."
+    # Intern Key: Restricted to gpt-4o-mini & mock-model ($1.00 daily budget, 100 RPM)
+    echo "    Creating Intern Key ('sk-agent-intern-poc')..."
     curl -s -X POST "$GATEWAY_URL/key/generate" \
       -H "Authorization: Bearer $MASTER_KEY" \
       -H "Content-Type: application/json" \
       -d '{
-        "key": "sk-agent-intern",
-        "key_alias": "sk-agent-intern",
+        "key": "sk-agent-intern-poc",
+        "key_alias": "sk-agent-intern-poc",
         "models": ["gpt-4o-mini", "mock-model"],
         "max_budget": 1.0,
+        "rpm_limit": 100,
         "duration": "1d",
         "metadata": {"role": "intern"}
       }' >/dev/null && echo "    ✅ Intern key provisioned." || echo "    ⚠️ Note: Check if key already exists."
+
+    # CI Pipeline Key: Restricted to gpt-4o-mini & mock-model ($2.00 daily budget, 60 RPM)
+    echo "    Creating CI Pipeline Key ('sk-agent-ci-pipeline')..."
+    curl -s -X POST "$GATEWAY_URL/key/generate" \
+      -H "Authorization: Bearer $MASTER_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "key": "sk-agent-ci-pipeline",
+        "key_alias": "sk-agent-ci-pipeline",
+        "models": ["gpt-4o-mini", "mock-model"],
+        "max_budget": 2.0,
+        "rpm_limit": 60,
+        "duration": "1d",
+        "metadata": {"role": "ci_pipeline"}
+      }' >/dev/null && echo "    ✅ CI Pipeline key provisioned." || echo "    ⚠️ Note: Check if key already exists."
+
+    # Budget-Capped Test Key: $0.0001 budget ceiling to verify HTTP 429
+    echo "    Creating Budget-Capped Test Key ('sk-agent-budget-capped')..."
+    curl -s -X POST "$GATEWAY_URL/key/generate" \
+      -H "Authorization: Bearer $MASTER_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "key": "sk-agent-budget-capped",
+        "key_alias": "sk-agent-budget-capped",
+        "models": ["mock-model"],
+        "max_budget": 0.0001,
+        "duration": "1d",
+        "metadata": {"role": "test_capped"}
+      }' >/dev/null && echo "    ✅ Budget-capped key provisioned." || echo "    ⚠️ Note: Check if key already exists."
 }
 
 # 5. Display Summary and Endpoints
@@ -98,7 +130,7 @@ show_summary() {
     echo "• Swagger API Docs:      $GATEWAY_URL/docs"
     echo "• Jaeger Distributed UI: http://localhost:16686"
     echo "• CPS Webhook Listener:  $CPS_URL/webhooks/github"
-    echo "• SQLite Database:       $SCRIPT_DIR/gateway.db"
+    echo "• SQLite Database:       $SCRIPT_DIR/data/gateway.db"
     echo "=============================================================================="
     echo "Test Commands:"
     echo "1. Test Allowed Request:"

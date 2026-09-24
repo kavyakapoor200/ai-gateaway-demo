@@ -77,6 +77,61 @@ class ZDRAuditLogger(CustomLogger):
                 if os.path.exists(schema_path):
                     with open(schema_path, "r") as f:
                         conn.executescript(f.read())
+                else:
+                    # Embedded self-healing fallback DDL
+                    conn.executescript("""
+                    CREATE TABLE IF NOT EXISTS gateway_audit_ledger (
+                        request_id TEXT PRIMARY KEY,
+                        trace_id TEXT NOT NULL,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        api_key_alias TEXT NOT NULL,
+                        caller_role TEXT NOT NULL DEFAULT 'developer',
+                        model_requested TEXT NOT NULL,
+                        model_routed TEXT NOT NULL,
+                        fallback_triggered INTEGER DEFAULT 0,
+                        http_status INTEGER NOT NULL,
+                        latency_ms REAL NOT NULL,
+                        prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                        completion_tokens INTEGER NOT NULL DEFAULT 0,
+                        cost_usd REAL NOT NULL DEFAULT 0.0,
+                        prompt_sha256 TEXT NOT NULL,
+                        completion_sha256 TEXT NOT NULL,
+                        zdr_verified INTEGER DEFAULT 1,
+                        task_id TEXT,
+                        task_outcome TEXT DEFAULT 'pending'
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_trace_id ON gateway_audit_ledger(trace_id);
+                    CREATE INDEX IF NOT EXISTS idx_task_id ON gateway_audit_ledger(task_id);
+                    CREATE INDEX IF NOT EXISTS idx_created_at ON gateway_audit_ledger(created_at);
+                    CREATE VIEW IF NOT EXISTS v_coding_cps_summary AS
+                    SELECT 
+                        task_id,
+                        COUNT(request_id) AS total_turns,
+                        SUM(prompt_tokens + completion_tokens) AS total_tokens,
+                        ROUND(SUM(cost_usd), 6) AS accumulated_cost_usd,
+                        task_outcome,
+                        CASE 
+                            WHEN task_outcome = 'verified_success' THEN ROUND(SUM(cost_usd), 6)
+                            ELSE NULL 
+                        END AS final_cps_usd
+                    FROM gateway_audit_ledger
+                    WHERE task_id IS NOT NULL
+                    GROUP BY task_id, task_outcome;
+                    CREATE VIEW IF NOT EXISTS v_zdr_compliance_check AS
+                    SELECT 
+                        COUNT(*) AS total_records,
+                        SUM(CASE WHEN LENGTH(prompt_sha256) = 64 AND prompt_sha256 GLOB '[0-9a-f]*' THEN 1 ELSE 0 END) AS valid_prompt_hashes,
+                        SUM(CASE WHEN LENGTH(completion_sha256) = 64 AND completion_sha256 GLOB '[0-9a-f]*' THEN 1 ELSE 0 END) AS valid_completion_hashes,
+                        SUM(CASE WHEN zdr_verified = 1 THEN 1 ELSE 0 END) AS zdr_flags_valid,
+                        CASE 
+                            WHEN COUNT(*) = 0 THEN 'NO RECORDS YET'
+                            WHEN COUNT(*) = SUM(CASE WHEN LENGTH(prompt_sha256) = 64 AND prompt_sha256 GLOB '[0-9a-f]*' THEN 1 ELSE 0 END)
+                             AND COUNT(*) = SUM(CASE WHEN LENGTH(completion_sha256) = 64 AND completion_sha256 GLOB '[0-9a-f]*' THEN 1 ELSE 0 END)
+                            THEN '100% COMPLIANT - ZERO PLAINTEXT DETECTED'
+                            ELSE 'VIOLATION DETECTED - AUDIT REQUIRED'
+                        END AS compliance_status
+                    FROM gateway_audit_ledger;
+                    """)
             conn.close()
         except Exception as e:
             print(f"[!] ZDRAuditLogger: Schema bootstrap notice: {e}", file=sys.stderr)
@@ -234,6 +289,40 @@ class ZDRAuditLogger(CustomLogger):
 
         cost = ((prompt_tokens / 1_000_000.0) * p_cost) + ((completion_tokens / 1_000_000.0) * c_cost)
         return round(cost, 6)
+
+    async def async_pre_call_hook(
+        self,
+        user_api_key_dict: Any,
+        cache: Any,
+        data: dict,
+        call_type: str,
+    ) -> Optional[dict]:
+        """
+        Ingress Pre-Call Hook:
+        1. Scrubs secrets (AWS keys, API keys, email addresses) into [REDACTED].
+        2. Sniffs Git branch checkout/creation in messages and indexes bhash in Redis.
+        """
+        try:
+            messages = data.get("messages")
+            if messages and isinstance(messages, list):
+                for msg in messages:
+                    if isinstance(msg, dict) and "content" in msg and isinstance(msg["content"], str):
+                        content = msg["content"]
+                        # AWS Secret Key
+                        content = re.sub(r'(?i)AKIA[0-9A-Z]{16}', '[REDACTED]', content)
+                        # API Secret Keys (exclude proxy user bearer keys if not a secret)
+                        content = re.sub(r'sk-(?!agent-)[a-zA-Z0-9_\-]{20,}', '[REDACTED]', content)
+                        # Email Addresses
+                        content = re.sub(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', '[REDACTED]', content)
+                        msg["content"] = content
+
+                key_alias = getattr(user_api_key_dict, "key_alias", None) if user_api_key_dict else None
+                task_id = self._derive_task_id(key_alias, messages)
+                tool_calls = data.get("tools") or data.get("tool_calls")
+                self._sniff_and_index_branch(messages, tool_calls, task_id)
+        except Exception as e:
+            print(f"[!] async_pre_call_hook error: {e}", file=sys.stderr)
+        return data
 
     def log_success_event(self, kwargs: Dict[str, Any], response_obj: Any, start_time: Any, end_time: Any) -> bool:
         """Logs successful request metadata into gateway_audit_ledger."""

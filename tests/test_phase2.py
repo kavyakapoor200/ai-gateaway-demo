@@ -35,8 +35,10 @@ import cps_webhook_server
 import mock_local_pr
 
 DB_PATH = os.path.join(PROJECT_ROOT, "data", "gateway.db")
-WEBHOOK_PORT = 4001
+WEBHOOK_PORT = 4002
 WEBHOOK_URL = f"http://localhost:{WEBHOOK_PORT}"
+os.environ["GATEWAY_WEBHOOK_URL"] = f"{WEBHOOK_URL}/webhooks/github"
+mock_local_pr.GATEWAY_WEBHOOK_URL = f"{WEBHOOK_URL}/webhooks/github"
 
 
 def print_header(title: str):

@@ -7,9 +7,10 @@ import sys
 import subprocess
 import argparse
 import urllib.request
+import os
 import json
 
-GATEWAY_WEBHOOK_URL = "http://localhost:4001/webhooks/github"
+GATEWAY_WEBHOOK_URL = os.environ.get("GATEWAY_WEBHOOK_URL", "http://localhost:4001/webhooks/github")
 
 def run_cmd(cmd):
     """Executes shell command with stdout capture."""

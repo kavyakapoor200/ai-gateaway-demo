@@ -1,11 +1,11 @@
-version: '3.8'
-
 services:
   # ----------------------------------------------------------------------------
   # 1. LiteLLM Core AI Gateway Proxy
   # ----------------------------------------------------------------------------
   litellm:
-    image: ghcr.io/berriai/litellm:main-latest
+    build:
+      context: .
+      dockerfile: Dockerfile.litellm
     container_name: litellm_gateway
     restart: unless-stopped
     ports:
@@ -13,31 +13,49 @@ services:
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/litellm
       - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-enterprise-master-secret-key-2026}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - LITELLM_OTEL_V2=true
+      - DB_PATH=/app/data/gateway.db
     volumes:
-      - ./litellm_config.yaml:/app/config.yaml
-      - ./custom_zdr_logger.py:/app/custom_zdr_logger.py # In-RAM ZDR logger & branch sniffer
-      - ./gateway.db:/app/gateway.db                     # Embedded SQLite ledger
+      - gateway_data:/app/data
     command: ["--config", "/app/config.yaml", "--port", "4000", "--num_workers", "2"]
     depends_on:
       - redis
+      - postgres
       - jaeger
+      - mock_upstream
 
   # ----------------------------------------------------------------------------
-  # 2. Redis 7 (Rate Limiting, Real-Time Budgets & Hashed Branch Registry)
+  # 2. PostgreSQL 16 (Required for LiteLLM Prisma Key Management & User Roles)
+  # ----------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: gateway_postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=litellm
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  # ----------------------------------------------------------------------------
+  # 3. Redis 7 (Rate Limiting, Real-Time Budgets & Hashed Branch Registry)
   # ----------------------------------------------------------------------------
   redis:
     image: redis:7-alpine
     container_name: gateway_redis
     restart: unless-stopped
     ports:
-      - "6379:6379"
+      - "6380:6379"
 
   # ----------------------------------------------------------------------------
-  # 3. Jaeger All-in-One (OTel Trace Collector & Flow UI)
+  # 4. Jaeger All-in-One (OTel Trace Collector & Flow UI)
   # ----------------------------------------------------------------------------
   jaeger:
     image: jaegertracing/all-in-one:latest
@@ -51,23 +69,42 @@ services:
       - COLLECTOR_OTLP_ENABLED=true
 
   # ----------------------------------------------------------------------------
-  # 4. CPS Git Merge Lifecycle Webhook Service
+  # 5. CPS Git Merge Lifecycle Webhook Service
   # ----------------------------------------------------------------------------
   cps_webhook:
-    image: python:3.11-slim
+    build:
+      context: .
+      dockerfile: Dockerfile.webhook
     container_name: gateway_cps_webhook
     restart: unless-stopped
     working_dir: /app
     volumes:
-      - ./cps_webhook_server.py:/app/cps_webhook_server.py
-      - ./gateway.db:/app/gateway.db
+      - gateway_data:/app/data
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - DB_PATH=/app/gateway.db
+      - DB_PATH=/app/data/gateway.db
       - WEBHOOK_PORT=4001
     command: ["python", "-u", "cps_webhook_server.py"]
     ports:
       - "4001:4001"
     depends_on:
       - redis
+
+  # ----------------------------------------------------------------------------
+  # 6. Zero-Cost Mock Upstream LLM Server
+  # ----------------------------------------------------------------------------
+  mock_upstream:
+    build:
+      context: .
+      dockerfile: Dockerfile.mock
+    container_name: gateway_mock_upstream
+    restart: unless-stopped
+    working_dir: /app
+    command: ["python", "-u", "mock_upstream_server.py", "--port", "8080", "--host", "0.0.0.0"]
+    ports:
+      - "8088:8080"
+
+volumes:
+  pgdata:
+  gateway_data:

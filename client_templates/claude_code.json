@@ -1,0 +1,7 @@
+{
+  "api_base": "http://localhost:4000/v1",
+  "api_key": "sk-agent-developer",
+  "default_model": "claude-3-5-sonnet",
+  "temperature": 0.2,
+  "max_tokens": 4096
+}

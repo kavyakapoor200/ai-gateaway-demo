@@ -5,7 +5,7 @@ Features:
 1. Listens on port 4001 for GitHub PR merge webhooks (/webhooks/github).
 2. Resolves task_id from Redis bhash:<sha256> and updates SQLite gateway.db.
 3. Serves the interactive AI Gateway CPS & ZDR Observability Dashboard (GET / & GET /dashboard).
-4. Serves JSON APIs: /api/stats, /api/cps, /api/audit.
+4. Serves JSON APIs: /api/stats, /api/cps, /api/audit (with ?q= or ?request_id= search support).
 """
 import os
 import sys
@@ -13,6 +13,7 @@ import json
 import hashlib
 import sqlite3
 import socket
+from urllib.parse import urlparse, parse_qs
 from typing import Optional, Dict, Any, List
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -109,23 +110,37 @@ def get_cps_summary() -> List[Dict[str, Any]]:
         print(f"[!] get_cps_summary error: {e}", file=sys.stderr)
     return rows
 
-def get_recent_audit_records(limit: int = 50) -> List[Dict[str, Any]]:
+def get_recent_audit_records(limit: int = 50, query: Optional[str] = None) -> List[Dict[str, Any]]:
     db_path = get_db_path()
     rows = []
     try:
         conn = sqlite3.connect(db_path, timeout=5.0)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
-        cur.execute("""
-            SELECT request_id, trace_id, created_at, api_key_alias, caller_role,
-                   model_requested, model_routed, http_status, latency_ms,
-                   prompt_tokens, completion_tokens, cost_usd,
-                   prompt_sha256, completion_sha256, zdr_verified,
-                   task_id, task_outcome
-            FROM gateway_audit_ledger
-            ORDER BY created_at DESC
-            LIMIT ?
-        """, (limit,))
+        if query and query.strip():
+            q = query.strip()
+            cur.execute("""
+                SELECT request_id, trace_id, created_at, api_key_alias, caller_role,
+                       model_requested, model_routed, http_status, latency_ms,
+                       prompt_tokens, completion_tokens, cost_usd,
+                       prompt_sha256, completion_sha256, zdr_verified,
+                       task_id, task_outcome
+                FROM gateway_audit_ledger
+                WHERE request_id LIKE ? OR task_id LIKE ? OR trace_id LIKE ? OR api_key_alias LIKE ?
+                ORDER BY created_at DESC
+                LIMIT ?
+            """, (f"%{q}%", f"%{q}%", f"%{q}%", f"%{q}%", limit))
+        else:
+            cur.execute("""
+                SELECT request_id, trace_id, created_at, api_key_alias, caller_role,
+                       model_requested, model_routed, http_status, latency_ms,
+                       prompt_tokens, completion_tokens, cost_usd,
+                       prompt_sha256, completion_sha256, zdr_verified,
+                       task_id, task_outcome
+                FROM gateway_audit_ledger
+                ORDER BY created_at DESC
+                LIMIT ?
+            """, (limit,))
         rows = [dict(r) for r in cur.fetchall()]
         conn.close()
     except Exception as e:
@@ -330,11 +345,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       box-shadow: 0 8px 30px rgba(0, 0, 0, 0.3);
     }
     .section-header {
-      padding: 20px 24px;
+      padding: 18px 24px;
       border-bottom: 1px solid var(--border-subtle);
       display: flex;
       align-items: center;
       justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
       background: rgba(255, 255, 255, 0.015);
     }
     .section-title {
@@ -352,6 +369,72 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       border-radius: 12px;
       font-size: 0.75rem;
       font-weight: 600;
+    }
+    /* Search Box Styles */
+    .search-wrapper {
+      position: relative;
+      display: flex;
+      align-items: center;
+      min-width: 320px;
+    }
+    .search-icon {
+      position: absolute;
+      left: 12px;
+      color: var(--text-dim);
+      pointer-events: none;
+      transition: color 0.2s;
+    }
+    .search-input {
+      width: 100%;
+      background: rgba(15, 23, 42, 0.7);
+      border: 1px solid var(--border-subtle);
+      color: var(--text-main);
+      font-family: var(--font-mono);
+      font-size: 0.8125rem;
+      padding: 8px 34px 8px 36px;
+      border-radius: 8px;
+      outline: none;
+      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .search-input:focus {
+      background: rgba(15, 23, 42, 0.95);
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.25);
+    }
+    .search-input:focus + .search-icon {
+      color: var(--primary-light);
+    }
+    .search-clear {
+      position: absolute;
+      right: 10px;
+      background: none;
+      border: none;
+      color: var(--text-dim);
+      cursor: pointer;
+      font-size: 0.875rem;
+      padding: 2px 6px;
+      border-radius: 4px;
+      display: none;
+      transition: all 0.2s;
+    }
+    .search-clear:hover {
+      color: var(--text-main);
+      background: rgba(255, 255, 255, 0.08);
+    }
+    .highlight-match {
+      background: rgba(99, 102, 241, 0.45);
+      color: #ffffff;
+      padding: 1px 3px;
+      border-radius: 3px;
+      font-weight: 600;
+    }
+    .copyable-req {
+      cursor: pointer;
+      transition: color 0.2s;
+    }
+    .copyable-req:hover {
+      color: var(--primary-light);
+      text-decoration: underline;
     }
     .table-container {
       overflow-x: auto;
@@ -532,14 +615,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- Section 2: Recent Transaction Audit Log -->
+    <!-- Section 2: Recent Transaction Audit Log with Search Box -->
     <div class="section-box">
       <div class="section-header">
         <div class="section-title">
           <span>Zero Data Retention Audit Ledger & Traces</span>
           <span class="badge-count" id="badge-audit-count">0 Calls</span>
         </div>
-        <div style="font-size: 0.8125rem; color: var(--text-dim);">Source: <code>gateway_audit_ledger</code></div>
+        <!-- Search by Request ID, Task ID, or Trace ID -->
+        <div class="search-wrapper">
+          <svg class="search-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+            <circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>
+          </svg>
+          <input type="text" id="input-search-request" class="search-input" placeholder="Search by Request ID (e.g. chatcmpl-...)" autocomplete="off" spellcheck="false" />
+          <button id="btn-clear-search" class="search-clear" title="Clear search">✕</button>
+        </div>
       </div>
       <div class="table-container">
         <table>
@@ -565,12 +655,37 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </main>
 
   <script>
-    async function fetchDashboardData() {
+    let currentSearchQuery = "";
+    let searchDebounceTimer = null;
+
+    function highlightText(text, query) {
+      if (!query || !text) return text || "";
+      const escaped = query.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');
+      const regex = new RegExp(`(${escaped})`, 'gi');
+      return String(text).replace(regex, '<span class="highlight-match">$1</span>');
+    }
+
+    async function copyToClipboard(text, elem) {
       try {
+        await navigator.clipboard.writeText(text);
+        const originalText = elem.innerHTML;
+        elem.innerHTML = '<span style="color:var(--accent-emerald);">Copied!</span>';
+        setTimeout(() => { elem.innerHTML = originalText; }, 1200);
+      } catch (e) {
+        console.error("Copy failed:", e);
+      }
+    }
+
+    async function fetchDashboardData(isManualSearch = false) {
+      try {
+        const auditUrl = currentSearchQuery 
+          ? `/api/audit?q=${encodeURIComponent(currentSearchQuery)}`
+          : '/api/audit';
+
         const [statsRes, cpsRes, auditRes] = await Promise.all([
           fetch('/api/stats').then(r => r.json()),
           fetch('/api/cps').then(r => r.json()),
-          fetch('/api/audit').then(r => r.json())
+          fetch(auditUrl).then(r => r.json())
         ]);
 
         // 1. Update KPIs
@@ -599,7 +714,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               : `<span style="color:var(--text-dim);">Pending Verification</span>`;
 
             return `<tr>
-              <td><span class="mono" style="color:var(--primary-light);">${t.task_id}</span></td>
+              <td><span class="mono" style="color:var(--primary-light); cursor:pointer;" onclick="setSearchFilter('${t.task_id}')" title="Click to filter transactions by this Task ID">${t.task_id}</span></td>
               <td>${t.total_turns} turns</td>
               <td>${t.total_tokens || 0}</td>
               <td class="mono">$${Number(t.accumulated_cost_usd || 0).toFixed(6)}</td>
@@ -610,18 +725,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
 
         // 3. Render Audit Table
-        document.getElementById('badge-audit-count').textContent = `${auditRes.length} Calls`;
+        const countLabel = currentSearchQuery ? `${auditRes.length} Matching` : `${auditRes.length} Calls`;
+        document.getElementById('badge-audit-count').textContent = countLabel;
         const tbodyAudit = document.getElementById('tbody-audit');
         if (auditRes.length === 0) {
-          tbodyAudit.innerHTML = '<tr><td colspan="9" style="text-align:center; color:var(--text-dim); padding:24px;">No audit records found.</td></tr>';
+          const emptyMsg = currentSearchQuery 
+            ? `No transactions found matching Request ID "<strong>${currentSearchQuery}</strong>". <button onclick="clearSearchFilter()" style="margin-left:8px; background:rgba(99,102,241,0.2); border:1px solid rgba(99,102,241,0.4); color:var(--primary-light); padding:3px 8px; border-radius:4px; cursor:pointer;">Reset</button>`
+            : 'No audit records found.';
+          tbodyAudit.innerHTML = `<tr><td colspan="9" style="text-align:center; color:var(--text-dim); padding:32px;">${emptyMsg}</td></tr>`;
         } else {
           tbodyAudit.innerHTML = auditRes.map(r => {
             const promptHashShort = r.prompt_sha256 ? `${r.prompt_sha256.substring(0, 8)}...${r.prompt_sha256.substring(56)}` : '-';
             const jaegerLink = `http://${window.location.hostname}:16686/trace/${r.trace_id}`;
+            const reqDisplay = highlightText(r.request_id, currentSearchQuery);
             return `<tr>
               <td style="color:var(--text-dim); font-size:0.75rem;">${r.created_at || '-'}</td>
-              <td><span class="mono">${r.request_id}</span></td>
-              <td><span class="mono" style="color:var(--text-muted);">${r.api_key_alias || 'developer'}</span></td>
+              <td><span class="mono copyable-req" onclick="copyToClipboard('${r.request_id}', this)" title="Click to copy Request ID">${reqDisplay}</span></td>
+              <td><span class="mono" style="color:var(--text-muted);">${highlightText(r.api_key_alias || 'developer', currentSearchQuery)}</span></td>
               <td><span style="font-weight:500;">${r.model_routed || r.model_requested}</span></td>
               <td class="mono">${r.latency_ms ? r.latency_ms.toFixed(1) : 0}ms</td>
               <td class="mono">${r.prompt_tokens || 0} / ${r.completion_tokens || 0}</td>
@@ -640,6 +760,39 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         console.error("Dashboard refresh error:", err);
       }
     }
+
+    function setSearchFilter(val) {
+      const searchInput = document.getElementById('input-search-request');
+      const clearBtn = document.getElementById('btn-clear-search');
+      searchInput.value = val;
+      currentSearchQuery = val.trim();
+      clearBtn.style.display = currentSearchQuery ? 'block' : 'none';
+      fetchDashboardData(true);
+    }
+
+    function clearSearchFilter() {
+      const searchInput = document.getElementById('input-search-request');
+      const clearBtn = document.getElementById('btn-clear-search');
+      searchInput.value = '';
+      currentSearchQuery = '';
+      clearBtn.style.display = 'none';
+      fetchDashboardData(true);
+      searchInput.focus();
+    }
+
+    const searchInput = document.getElementById('input-search-request');
+    const clearBtn = document.getElementById('btn-clear-search');
+
+    searchInput.addEventListener('input', (e) => {
+      currentSearchQuery = e.target.value.trim();
+      clearBtn.style.display = currentSearchQuery ? 'block' : 'none';
+      clearTimeout(searchDebounceTimer);
+      searchDebounceTimer = setTimeout(() => {
+        fetchDashboardData(true);
+      }, 200);
+    });
+
+    clearBtn.addEventListener('click', clearSearchFilter);
 
     fetchDashboardData();
     setInterval(fetchDashboardData, 3000);
@@ -681,7 +834,12 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         elif self.path.startswith("/api/audit"):
-            data = get_recent_audit_records(limit=40)
+            q_param = None
+            if "?" in self.path:
+                parsed = urlparse(self.path)
+                qs = parse_qs(parsed.query)
+                q_param = qs.get("q", [None])[0] or qs.get("request_id", [None])[0]
+            data = get_recent_audit_records(limit=60, query=q_param)
             body = json.dumps(data).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")

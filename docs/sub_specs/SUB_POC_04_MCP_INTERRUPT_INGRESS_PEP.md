@@ -85,13 +85,15 @@ Before routing, token counting, or contacting any LLM backend:
 | **REQ-MCP-01** | The gateway MUST intercept incoming requests on `/v1/messages` and `/v1/chat/completions` before dispatching to any model router. | Must | Integration test timing / Zero upstream calls |
 | **REQ-MCP-02** | The Gateway Ingress PEP MUST extract declared tool names from both Anthropic schema (`tool.name`) and OpenAI schema (`tool.function.name` or legacy `functions`). | Must | Dual-schema test vectors |
 | **REQ-MCP-03** | The gateway MUST retrieve the calling key's `allowed_tools` whitelist from LiteLLM key metadata (`user_api_key_dict.metadata["allowed_tools"]`). | Must | Key metadata lookup test |
-| **REQ-MCP-04** | If a request contains ANY tool name not included in or matched by `allowed_tools`, the gateway MUST abort and return `HTTP 403 Forbidden`. | Must | HTTP 403 assertion |
-| **REQ-MCP-05** | The HTTP 403 response body MUST contain error code `tool_not_allowed`, the list of violating tools, and the permitted tools. | Must | JSON body schema assertion |
+| **REQ-MCP-04A** | In `strict_reject` mode (`metadata.tool_policy="strict_reject"`), if a request contains ANY tool name not included in or matched by `allowed_tools`, the gateway MUST abort and return `HTTP 403 Forbidden`. | Must | HTTP 403 assertion |
+| **REQ-MCP-04B** | In `filter` mode (`metadata.tool_policy="filter"`, default for coding agent compatibility), the gateway MUST prune/strip unauthorized tools from `data["tools"]` so the model never sees them, allowing coding agents to start and function normally (HTTP 200 OK). | Must | Agent tool pruning test |
+| **REQ-MCP-05** | The HTTP 403 response body for rejected requests MUST contain error code `tool_not_allowed`, the list of violating tools, and the permitted tools. | Must | JSON body schema assertion |
 | **REQ-MCP-06** | The policy engine MUST support wildcard matching (e.g. `*` allows all tools, `git_*` allows all git tools). | Must | Wildcard unit tests |
 | **REQ-MCP-07** | If `allowed_tools` is omitted or null on a virtual key, the gateway MUST apply the default role policy (Developer = `*`, Intern = `["read_file", "git_status", "git_diff"]`). | Should | Default role policy test |
 | **REQ-MCP-08** | Disallowed requests MUST consume exactly 0 upstream tokens and incur $0.00 cost. | Must | Upstream mock / spend verify |
 | **REQ-MCP-09** | Disallowed attempts MUST be logged in `gateway_audit_ledger` with `http_status=403`, `task_outcome='tool_policy_rejected'`, and ZDR SHA-256 prompt hashing. | Must | SQLite ledger inspection |
 | **REQ-MCP-10** | Disallowed attempts MUST increment Prometheus counter `ai_gateway_tool_violations_total` labeled by `key_alias` and `violating_tool`. | Should | `/metrics` scraping assert |
+| **REQ-MCP-11** | LiteLLM's internal naive auth check is bypassed in favor of the ZDR PEP to allow wildcards (`*`) and tool pruning without fatal client crashes. | Must | Bypass assertion |
 
 ---
 

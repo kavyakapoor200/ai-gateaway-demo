@@ -76,7 +76,7 @@ provision_keys() {
         "max_budget": 5.0,
         "rpm_limit": 30,
         "duration": "1d",
-        "metadata": {"role": "developer"}
+        "metadata": {"role": "developer", "allowed_tools": ["*"], "tool_policy": "permissive"}
       }' >/dev/null && echo "    ✅ Developer key provisioned." || echo "    ⚠️ Note: Check if key already exists."
 
     # Intern Key: Restricted to gpt-4o-mini & mock-model ($1.00 daily budget, 100 RPM)
@@ -91,7 +91,7 @@ provision_keys() {
         "max_budget": 1.0,
         "rpm_limit": 100,
         "duration": "1d",
-        "metadata": {"role": "intern"}
+        "metadata": {"role": "intern", "allowed_tools": ["read_file", "git_status", "git_diff"], "tool_policy": "filter"}
       }' >/dev/null && echo "    ✅ Intern key provisioned." || echo "    ⚠️ Note: Check if key already exists."
 
     # CI Pipeline Key: Restricted to gpt-4o-mini & mock-model ($2.00 daily budget, 60 RPM)
@@ -108,6 +108,20 @@ provision_keys() {
         "duration": "1d",
         "metadata": {"role": "ci_pipeline"}
       }' >/dev/null && echo "    ✅ CI Pipeline key provisioned." || echo "    ⚠️ Note: Check if key already exists."
+
+    # MCP Test Key: Strict reject mode for SUB-POC-04 Ingress PEP assertions
+    echo "    Creating MCP Test Key ('sk-agent-mcp-test')..."
+    curl -s -X POST "$GATEWAY_URL/key/generate" \
+      -H "Authorization: Bearer $MASTER_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "key": "sk-agent-mcp-test",
+        "key_alias": "sk-agent-mcp-test",
+        "models": ["gpt-4o", "claude-3-5-sonnet", "mock-model", "qwen3.5:9b-mlx"],
+        "max_budget": 10.0,
+        "duration": "1d",
+        "metadata": {"role": "test", "allowed_tools": ["create_user_profile"], "tool_policy": "strict_reject"}
+      }' >/dev/null && echo "    ✅ MCP Test key provisioned." || echo "    ⚠️ Note: Check if key already exists."
 
     # Budget-Capped Test Key: $0.0001 budget ceiling to verify HTTP 429
     echo "    Creating Budget-Capped Test Key ('sk-agent-budget-capped')..."

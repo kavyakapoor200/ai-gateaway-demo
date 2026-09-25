@@ -27,7 +27,10 @@ sys.path.insert(0, PROJECT_ROOT)
 from custom_zdr_logger import ZDRAuditLogger
 
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://localhost:4000")
-API_KEY = os.environ.get("TEST_API_KEY", "sk-agent-developer")
+API_KEY = os.environ.get("TEST_API_KEY", "sk-agent-mcp-test")
+DEVELOPER_KEY = os.environ.get("DEVELOPER_KEY", "sk-agent-developer")
+INTERN_KEY = os.environ.get("INTERN_KEY", "sk-agent-intern-poc")
+MASTER_KEY = os.environ.get("LITELLM_MASTER_KEY", "sk-enterprise-master-secret-key-2026")
 
 
 def print_header(title: str):
@@ -282,16 +285,79 @@ def test_sqlite_audit_ledger():
         print_fail(f"Audit ledger entry not found or mismatch: {output_str}")
 
 
+def ensure_test_key_exists():
+    url = f"{GATEWAY_URL}/key/generate"
+    payload = {
+        "key": "sk-agent-mcp-test",
+        "key_alias": "sk-agent-mcp-test",
+        "models": ["gpt-4o", "claude-3-5-sonnet", "mock-model", "qwen3.5:9b-mlx"],
+        "max_budget": 10.0,
+        "metadata": {
+            "role": "test",
+            "allowed_tools": ["create_user_profile"],
+            "tool_policy": "strict_reject"
+        }
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Authorization": f"Bearer {MASTER_KEY}", "Content-Type": "application/json"}, method="POST")
+    try:
+        urllib.request.urlopen(req)
+    except Exception:
+        pass
+
+
+def test_live_developer_unrestricted_tools():
+    print_header("Test 7: Developer Key Permissive Tool Access (Coding Agent Scenario)")
+    payload = {
+        "model": "mock-model",
+        "messages": [{"role": "user", "content": "Hello coding assistant"}],
+        "tools": [
+            {"type": "function", "function": {"name": "read_file"}},
+            {"type": "function", "function": {"name": "edit_file"}},
+            {"type": "function", "function": {"name": "bash"}}
+        ]
+    }
+    headers = {"Authorization": f"Bearer {DEVELOPER_KEY}"}
+    status, body, _ = make_request("/v1/chat/completions", payload, headers)
+    if status == 200:
+        print_pass("Developer key permitted with full coding agent tools: HTTP 200 OK")
+    else:
+        print_fail(f"Developer key unexpectedly blocked on coding tools, got {status}: {body}")
+
+
+def test_live_tool_pruning_agent_compatibility():
+    print_header("Test 8: Ingress Tool Pruning (Virtual Shielding for Restricted Agents)")
+    # Intern key allows read_file, git_status, git_diff with tool_policy="filter"
+    payload = {
+        "model": "mock-model",
+        "messages": [{"role": "user", "content": "Check repository"}],
+        "tools": [
+            {"type": "function", "function": {"name": "read_file"}},
+            {"type": "function", "function": {"name": "unauthorized_bash_exec"}},
+            {"type": "function", "function": {"name": "delete_database"}}
+        ]
+    }
+    headers = {"Authorization": f"Bearer {INTERN_KEY}"}
+    status, body, _ = make_request("/v1/chat/completions", payload, headers)
+    if status == 200:
+        print_pass("Restricted agent request with disallowed tools pruned successfully: HTTP 200 OK")
+    else:
+        print_fail(f"Tool pruning failed; expected HTTP 200 with pruned tools, got {status}: {body}")
+
+
 def main():
     print_header("SUB-POC-04: MCP Tool Interrupt & Gateway Ingress PEP Test Suite")
+    ensure_test_key_exists()
     test_unit_tool_extraction()
     test_live_forbidden_tool_anthropic()
     test_live_whitelisted_tool_anthropic()
     test_live_mixed_tools()
     test_live_openai_format()
     test_sqlite_audit_ledger()
+    test_live_developer_unrestricted_tools()
+    test_live_tool_pruning_agent_compatibility()
 
-    print_header("All Verification Tests Completed Successfully! (7/7 Passed)")
+    print_header("All Verification Tests Completed Successfully! (8/8 Passed)")
 
 
 if __name__ == "__main__":

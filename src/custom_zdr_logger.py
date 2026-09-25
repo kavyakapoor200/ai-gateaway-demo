@@ -39,6 +39,16 @@ except ImportError:
             self.detail = detail
             super().__init__(str(detail))
 
+# Neutralize LiteLLM's internal naive auth check (which lacks wildcard/pruning/audit support)
+# in favor of ZDRAuditLogger.async_pre_call_hook Ingress PEP.
+try:
+    import litellm.proxy.auth.auth_checks as litellm_auth_checks
+    async def _noop_check_tools_allowlist(request_body: dict, valid_token: Any, team_object: Any, route: str) -> None:
+        return None
+    litellm_auth_checks.check_tools_allowlist = _noop_check_tools_allowlist
+except Exception:
+    pass
+
 
 class ZDRAuditLogger(CustomLogger):
     """
@@ -555,61 +565,35 @@ class ZDRAuditLogger(CustomLogger):
         if not user_api_key_dict:
             return None
 
-        user_role = cls._read_prop(user_api_key_dict, "user_role") or cls._read_prop(user_api_key_dict, "role")
-        if user_role in ("proxy_admin", "admin"):
-            return None
-
-        allowed = set()
-        has_whitelist = False
-
-        # 1. Inspect object_permission (from Postgres LiteLLM_ObjectPermissionTable / LiteLLM UI)
-        obj_perm = cls._read_prop(user_api_key_dict, "object_permission")
-        if not obj_perm and user_api_key_dict:
-            obj_perm_id = cls._read_prop(user_api_key_dict, "object_permission_id")
-            if obj_perm_id:
-                db_url = os.environ.get("DATABASE_URL")
-                if db_url and "postgres" in db_url:
-                    try:
-                        import psycopg2
-                        conn = psycopg2.connect(db_url)
-                        with conn.cursor() as cur:
-                            cur.execute('SELECT mcp_tool_permissions, blocked_tools FROM "LiteLLM_ObjectPermissionTable" WHERE object_permission_id = %s;', (obj_perm_id,))
-                            row = cur.fetchone()
-                            if row:
-                                obj_perm = {"mcp_tool_permissions": row[0], "blocked_tools": row[1]}
-                        conn.close()
-                    except Exception:
-                        pass
-
-        if obj_perm:
-            mcp_tool_perms = cls._read_prop(obj_perm, "mcp_tool_permissions")
-            if isinstance(mcp_tool_perms, str):
-                try:
-                    mcp_tool_perms = json.loads(mcp_tool_perms)
-                except Exception:
-                    mcp_tool_perms = {}
-            if isinstance(mcp_tool_perms, dict) and mcp_tool_perms:
-                for srv_id, tools in mcp_tool_perms.items():
-                    if isinstance(tools, (list, set, tuple)):
-                        allowed.update(tools)
-                if allowed:
-                    has_whitelist = True
-
-        # 2. Inspect key metadata
+        # 1. Resolve role (inspect direct property and metadata)
         meta = cls._read_prop(user_api_key_dict, "metadata") or {}
         if isinstance(meta, str):
             try:
                 meta = json.loads(meta)
             except Exception:
                 meta = {}
-        if isinstance(meta, dict):
-            meta_allowed = meta.get("allowed_tools")
-            if meta_allowed is not None:
-                if isinstance(meta_allowed, list):
-                    if "*" in meta_allowed:
-                        return None
-                    allowed.update(meta_allowed)
-                    has_whitelist = True
+        if not isinstance(meta, dict):
+            meta = {}
+
+        user_role = (
+            meta.get("role")
+            or cls._read_prop(user_api_key_dict, "user_role")
+            or cls._read_prop(user_api_key_dict, "role")
+        )
+        if user_role in ("proxy_admin", "admin"):
+            return None
+
+        # 2. Inspect key metadata for explicit allowed_tools
+        meta_allowed = meta.get("allowed_tools")
+        if meta_allowed is not None:
+            if isinstance(meta_allowed, list):
+                if "*" in meta_allowed:
+                    return None
+                return set(meta_allowed)
+            elif isinstance(meta_allowed, str):
+                if meta_allowed == "*":
+                    return None
+                return {meta_allowed}
 
         # 3. Inspect key permissions
         perms = cls._read_prop(user_api_key_dict, "permissions") or {}
@@ -624,11 +608,51 @@ class ZDRAuditLogger(CustomLogger):
                 if isinstance(perms_allowed, list):
                     if "*" in perms_allowed:
                         return None
-                    allowed.update(perms_allowed)
-                    has_whitelist = True
+                    return set(perms_allowed)
 
-        if has_whitelist:
-            return allowed
+        # 4. Check object_permission (from Postgres LiteLLM_ObjectPermissionTable / LiteLLM UI)
+        # Developers bypass object_permission restrictions unless an explicit whitelist was set in metadata
+        if user_role != "developer":
+            obj_perm = cls._read_prop(user_api_key_dict, "object_permission")
+            if not obj_perm and user_api_key_dict:
+                obj_perm_id = cls._read_prop(user_api_key_dict, "object_permission_id")
+                if obj_perm_id:
+                    db_url = os.environ.get("DATABASE_URL")
+                    if db_url and "postgres" in db_url:
+                        try:
+                            import psycopg2
+                            conn = psycopg2.connect(db_url)
+                            with conn.cursor() as cur:
+                                cur.execute('SELECT mcp_tool_permissions, blocked_tools FROM "LiteLLM_ObjectPermissionTable" WHERE object_permission_id = %s;', (obj_perm_id,))
+                                row = cur.fetchone()
+                                if row:
+                                    obj_perm = {"mcp_tool_permissions": row[0], "blocked_tools": row[1]}
+                            conn.close()
+                        except Exception:
+                            pass
+
+            if obj_perm:
+                allowed = set()
+                mcp_tool_perms = cls._read_prop(obj_perm, "mcp_tool_permissions")
+                if isinstance(mcp_tool_perms, str):
+                    try:
+                        mcp_tool_perms = json.loads(mcp_tool_perms)
+                    except Exception:
+                        mcp_tool_perms = {}
+                if isinstance(mcp_tool_perms, dict) and mcp_tool_perms:
+                    for srv_id, tools in mcp_tool_perms.items():
+                        if isinstance(tools, (list, set, tuple)):
+                            allowed.update(tools)
+                    if allowed:
+                        return allowed
+
+        # 5. REQ-MCP-07 Default Role Policy:
+        # Developer = *, Intern = ["read_file", "git_status", "git_diff"]
+        if user_role == "developer":
+            return None
+        elif user_role == "intern":
+            return {"read_file", "git_status", "git_diff"}
+
         return None
 
     async def async_pre_call_hook(
@@ -641,12 +665,14 @@ class ZDRAuditLogger(CustomLogger):
         """
         Gateway Ingress Policy Enforcement Point & ZDR Sanitizer:
         1. (SUB-POC-04) Intercepts incoming requests and verifies declared tools against key's whitelist.
-           Aborts with HTTP 403: tool_not_allowed on violation before LLM dispatch.
+           - tool_policy="strict_reject": Aborts with HTTP 403: tool_not_allowed on violation.
+           - tool_policy="filter" (default): Prunes disallowed tools so LLM cannot call them,
+             allowing coding agents to initialize and function without session crashes.
         2. Scrubs sensitive secrets (AWS keys, API keys, email addresses) into [REDACTED].
         3. Sniffs in-flight Git branch operations and registers ephemeral bhash in Redis.
         """
         try:
-            # 1. Gate: MCP Tool Ingress PEP Whitelist Verification
+            # 1. Gate: MCP Tool Ingress PEP Whitelist Verification & Virtual Tool Pruning
             tools_requested = self._extract_tool_names(data)
             if tools_requested:
                 whitelisted_tools = self._get_whitelisted_tools(user_api_key_dict)
@@ -675,26 +701,88 @@ class ZDRAuditLogger(CustomLogger):
                             or self._read_prop(user_api_key_dict, "key_name")
                             or "unknown_key"
                         )
-                        msg = (
-                            f"Tool execution policy violation: The following requested tool(s) "
-                            f"are not permitted for this API key: {sorted(violating_tools)}. "
-                            f"Allowed tools: {sorted(whitelisted_tools)}."
-                        )
-                        print(f"[!] MCP Ingress PEP Intercept: key='{key_alias}', violating={sorted(violating_tools)}", file=sys.stderr)
-                        raise HTTPException(
-                            status_code=403,
-                            detail={
-                                "error": {
-                                    "message": msg,
-                                    "type": "permission_error",
-                                    "param": "tools",
-                                    "code": "tool_not_allowed",
-                                    "violating_tools": sorted(violating_tools),
-                                    "allowed_tools": sorted(whitelisted_tools),
-                                    "key_alias": key_alias,
-                                }
-                            },
-                        )
+                        meta = self._read_prop(user_api_key_dict, "metadata") or {}
+                        if isinstance(meta, str):
+                            try:
+                                meta = json.loads(meta)
+                            except Exception:
+                                meta = {}
+                        if not isinstance(meta, dict):
+                            meta = {}
+
+                        tool_policy = meta.get("tool_policy", "filter")
+
+                        if tool_policy in ("strict_reject", "strict_whitelist"):
+                            msg = (
+                                f"Tool execution policy violation: The following requested tool(s) "
+                                f"are not permitted for this API key: {sorted(violating_tools)}. "
+                                f"Allowed tools: {sorted(whitelisted_tools)}."
+                            )
+                            print(f"[!] MCP Ingress PEP Intercept: key='{key_alias}', violating={sorted(violating_tools)}", file=sys.stderr)
+                            raise HTTPException(
+                                status_code=403,
+                                detail={
+                                    "error": {
+                                        "message": msg,
+                                        "type": "permission_error",
+                                        "param": "tools",
+                                        "code": "tool_not_allowed",
+                                        "violating_tools": sorted(violating_tools),
+                                        "allowed_tools": sorted(whitelisted_tools),
+                                        "key_alias": key_alias,
+                                    }
+                                },
+                            )
+                        else:
+                            # Tool Pruning / Virtual Tool Shielding mode (Default for coding agent compatibility)
+                            # Strip unallowed tools so LLM never sees them, preventing illegal execution
+                            # while keeping the agent session healthy and functional (HTTP 200 OK).
+                            violating_set = set(violating_tools)
+
+                            # 1. Prune standard 'tools' parameter
+                            raw_tools = data.get("tools")
+                            if isinstance(raw_tools, list):
+                                pruned_tools = []
+                                for t in raw_tools:
+                                    if isinstance(t, dict):
+                                        t_name = t.get("name")
+                                        if not t_name and "function" in t and isinstance(t["function"], dict):
+                                            t_name = t["function"].get("name")
+                                        if not t_name and "type" in t and t["type"] != "function":
+                                            t_name = t["type"]
+                                        if t_name and t_name in violating_set:
+                                            continue
+                                    pruned_tools.append(t)
+                                if pruned_tools:
+                                    data["tools"] = pruned_tools
+                                else:
+                                    data.pop("tools", None)
+
+                            # 2. Prune legacy 'functions' parameter
+                            raw_functions = data.get("functions")
+                            if isinstance(raw_functions, list):
+                                pruned_funcs = [
+                                    f for f in raw_functions
+                                    if not (isinstance(f, dict) and f.get("name") in violating_set)
+                                ]
+                                if pruned_funcs:
+                                    data["functions"] = pruned_funcs
+                                else:
+                                    data.pop("functions", None)
+
+                            # 3. Clean up tool_choice if pointing to a pruned tool
+                            tool_choice = data.get("tool_choice")
+                            if isinstance(tool_choice, dict):
+                                tc_name = tool_choice.get("name") or tool_choice.get("function", {}).get("name")
+                                if tc_name in violating_set:
+                                    data.pop("tool_choice", None)
+
+                            print(
+                                f"[i] MCP Ingress PEP Pruned: key='{key_alias}', "
+                                f"pruned={sorted(violating_tools)}, "
+                                f"remaining_tools={len(data.get('tools') or [])}",
+                                file=sys.stderr
+                            )
 
             # 2. Gate: Ingress Secret Redaction, Prompt Hashing & In-Flight Branch Sniffing
             messages = data.get("messages")

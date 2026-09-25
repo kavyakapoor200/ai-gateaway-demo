@@ -18,7 +18,8 @@ import uuid
 import hashlib
 import sqlite3
 import socket
-from typing import Any, Dict, Optional, List
+import fnmatch
+from typing import Any, Dict, Optional, List, Set, Union
 
 # Gracefully inherit from LiteLLM CustomLogger if installed
 try:
@@ -27,6 +28,16 @@ except ImportError:
     class CustomLogger:
         """Standalone fallback for offline test and benchmark execution."""
         pass
+
+try:
+    from fastapi import HTTPException
+except ImportError:
+    class HTTPException(Exception):
+        """Fallback HTTPException when fastapi is unavailable."""
+        def __init__(self, status_code: int, detail: Any = None):
+            self.status_code = status_code
+            self.detail = detail
+            super().__init__(str(detail))
 
 
 class ZDRAuditLogger(CustomLogger):
@@ -484,11 +495,17 @@ class ZDRAuditLogger(CustomLogger):
             status = http_status
             if status is None:
                 if isinstance(response_obj, Exception):
-                    status = getattr(response_obj, "status_code", None) or getattr(response_obj, "http_status", None) or 500
+                    status = getattr(response_obj, "status_code", None) or getattr(response_obj, "http_status", None)
                 elif isinstance(response_obj, dict):
-                    status = response_obj.get("status_code") or 500
-                else:
-                    status = 500
+                    status = response_obj.get("status_code")
+
+            task_outcome = "failed"
+            err_str = f"{error or ''} {response_obj or ''} {kwargs.get('exception', '')}"
+            if "tool_not_allowed" in err_str or "Tool execution policy violation" in err_str:
+                status = 403
+                task_outcome = "tool_policy_rejected"
+            elif status is None:
+                status = 500
 
             if hasattr(start_time, "timestamp") and hasattr(end_time, "timestamp"):
                 latency_ms = round((end_time.timestamp() - start_time.timestamp()) * 1000.0, 2)
@@ -507,11 +524,11 @@ class ZDRAuditLogger(CustomLogger):
                     http_status, latency_ms, prompt_tokens, completion_tokens,
                     cost_usd, prompt_sha256, completion_sha256, zdr_verified,
                     task_id, task_outcome
-                ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, 0, 0, 0.0, ?, ?, 1, ?, 'failed')
+                ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, 0, 0, 0.0, ?, ?, 1, ?, ?)
             """, (
                 req_id, trace_id, key_alias, caller_role,
                 model_req, model_routed, status, latency_ms,
-                prompt_sha256, completion_sha256, task_id
+                prompt_sha256, completion_sha256, task_id, task_outcome
             ))
             conn.commit()
             conn.close()
@@ -527,6 +544,207 @@ class ZDRAuditLogger(CustomLogger):
     async def async_log_failure_event(self, kwargs: Dict[str, Any], response_obj: Any, start_time: Any, end_time: Any):
         """Asynchronous hook for LiteLLM async failure pipelines."""
         return self.log_failure_event(kwargs, response_obj, start_time, end_time)
+
+    @staticmethod
+    def _read_prop(target: Any, prop: str, default: Any = None) -> Any:
+        if target is None:
+            return default
+        if isinstance(target, dict):
+            return target.get(prop, default)
+        return getattr(target, prop, default)
+
+    @classmethod
+    def _extract_tool_names(cls, data: Dict[str, Any]) -> List[str]:
+        tool_names = []
+        if not data or not isinstance(data, dict):
+            return tool_names
+        
+        # 1. Anthropic & OpenAI standard 'tools' parameter
+        raw_tools = data.get("tools")
+        if isinstance(raw_tools, list):
+            for t in raw_tools:
+                if isinstance(t, dict):
+                    # Anthropic schema: {"name": "..."}
+                    if "name" in t and isinstance(t["name"], str):
+                        tool_names.append(t["name"])
+                    # OpenAI schema: {"type": "function", "function": {"name": "..."}}
+                    elif "function" in t and isinstance(t["function"], dict):
+                        fn_name = t["function"].get("name")
+                        if fn_name and isinstance(fn_name, str):
+                            tool_names.append(fn_name)
+                    elif "type" in t and isinstance(t["type"], str) and t["type"] != "function":
+                        tool_names.append(t["type"])
+        
+        # 2. Legacy OpenAI 'functions' parameter
+        raw_functions = data.get("functions")
+        if isinstance(raw_functions, list):
+            for f in raw_functions:
+                if isinstance(f, dict):
+                    fn_name = f.get("name")
+                    if fn_name and isinstance(fn_name, str):
+                        tool_names.append(fn_name)
+                        
+        return tool_names
+
+    @classmethod
+    def _get_whitelisted_tools(cls, user_api_key_dict: Any) -> Optional[Set[str]]:
+        """
+        Extracts whitelisted tools from user_api_key_dict:
+        Returns:
+          - None if no tool restrictions apply (or '*' is present)
+          - Set[str] of permitted tool names/patterns if a whitelist is enforced
+        """
+        if not user_api_key_dict:
+            return None
+
+        user_role = cls._read_prop(user_api_key_dict, "user_role") or cls._read_prop(user_api_key_dict, "role")
+        if user_role in ("proxy_admin", "admin"):
+            return None
+
+        allowed = set()
+        has_whitelist = False
+
+        # 1. Inspect object_permission (from Postgres LiteLLM_ObjectPermissionTable / LiteLLM UI)
+        obj_perm = cls._read_prop(user_api_key_dict, "object_permission")
+        if not obj_perm and user_api_key_dict:
+            obj_perm_id = cls._read_prop(user_api_key_dict, "object_permission_id")
+            if obj_perm_id:
+                db_url = os.environ.get("DATABASE_URL")
+                if db_url and "postgres" in db_url:
+                    try:
+                        import psycopg2
+                        conn = psycopg2.connect(db_url)
+                        with conn.cursor() as cur:
+                            cur.execute('SELECT mcp_tool_permissions, blocked_tools FROM "LiteLLM_ObjectPermissionTable" WHERE object_permission_id = %s;', (obj_perm_id,))
+                            row = cur.fetchone()
+                            if row:
+                                obj_perm = {"mcp_tool_permissions": row[0], "blocked_tools": row[1]}
+                        conn.close()
+                    except Exception:
+                        pass
+
+        if obj_perm:
+            mcp_tool_perms = cls._read_prop(obj_perm, "mcp_tool_permissions")
+            if isinstance(mcp_tool_perms, str):
+                try:
+                    mcp_tool_perms = json.loads(mcp_tool_perms)
+                except Exception:
+                    mcp_tool_perms = {}
+            if isinstance(mcp_tool_perms, dict) and mcp_tool_perms:
+                for srv_id, tools in mcp_tool_perms.items():
+                    if isinstance(tools, (list, set, tuple)):
+                        allowed.update(tools)
+                if allowed:
+                    has_whitelist = True
+
+        # 2. Inspect key metadata
+        meta = cls._read_prop(user_api_key_dict, "metadata") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = {}
+        if isinstance(meta, dict):
+            meta_allowed = meta.get("allowed_tools")
+            if meta_allowed is not None:
+                if isinstance(meta_allowed, list):
+                    if "*" in meta_allowed:
+                        return None
+                    allowed.update(meta_allowed)
+                    has_whitelist = True
+
+        # 3. Inspect key permissions
+        perms = cls._read_prop(user_api_key_dict, "permissions") or {}
+        if isinstance(perms, str):
+            try:
+                perms = json.loads(perms)
+            except Exception:
+                perms = {}
+        if isinstance(perms, dict):
+            perms_allowed = perms.get("allowed_tools") or perms.get("mcp_tools")
+            if perms_allowed is not None:
+                if isinstance(perms_allowed, list):
+                    if "*" in perms_allowed:
+                        return None
+                    allowed.update(perms_allowed)
+                    has_whitelist = True
+
+        if has_whitelist:
+            return allowed
+        return None
+
+    async def async_pre_call_hook(
+        self,
+        user_api_key_dict: Any,
+        cache: Any,
+        data: Dict[str, Any],
+        call_type: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Gateway Ingress Policy Enforcement Point (PEP) (SUB-POC-04).
+        Intercepts incoming requests and verifies declared tools against the key's whitelist.
+        Aborts with HTTP 403: tool_not_allowed on violation before LLM dispatch.
+        """
+        try:
+            tools_requested = self._extract_tool_names(data)
+            if not tools_requested:
+                return data
+
+            whitelisted_tools = self._get_whitelisted_tools(user_api_key_dict)
+            if whitelisted_tools is None:
+                # No whitelist restriction for this caller
+                return data
+
+            # Check for blocked tools on object_permission if present
+            obj_perm = self._read_prop(user_api_key_dict, "object_permission")
+            blocked_tools = set()
+            if obj_perm:
+                b_list = self._read_prop(obj_perm, "blocked_tools") or []
+                if isinstance(b_list, (list, set, tuple)):
+                    blocked_tools.update(b_list)
+
+            violating_tools = []
+            for tool in tools_requested:
+                if tool in blocked_tools:
+                    violating_tools.append(tool)
+                    continue
+                # Match against whitelist (exact or wildcard)
+                matched = any(tool == pat or fnmatch.fnmatch(tool, pat) for pat in whitelisted_tools)
+                if not matched:
+                    violating_tools.append(tool)
+
+            if violating_tools:
+                key_alias = (
+                    self._read_prop(user_api_key_dict, "key_alias")
+                    or self._read_prop(user_api_key_dict, "key_name")
+                    or "unknown_key"
+                )
+                msg = (
+                    f"Tool execution policy violation: The following requested tool(s) "
+                    f"are not permitted for this API key: {sorted(violating_tools)}. "
+                    f"Allowed tools: {sorted(whitelisted_tools)}."
+                )
+                print(f"[!] MCP Ingress PEP Intercept: key='{key_alias}', violating={sorted(violating_tools)}", file=sys.stderr)
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "error": {
+                            "message": msg,
+                            "type": "permission_error",
+                            "param": "tools",
+                            "code": "tool_not_allowed",
+                            "violating_tools": sorted(violating_tools),
+                            "allowed_tools": sorted(whitelisted_tools),
+                            "key_alias": key_alias,
+                        }
+                    },
+                )
+        except HTTPException:
+            raise
+        except Exception as e:
+            print(f"[!] ZDRAuditLogger: Notice in async_pre_call_hook: {e}", file=sys.stderr)
+
+        return data
 
 
 # Export singleton instances for LiteLLM Proxy dynamic loading

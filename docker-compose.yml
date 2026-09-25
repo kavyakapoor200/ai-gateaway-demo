@@ -27,6 +27,8 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - gateway_data:/app/data
+      - ./custom_zdr_logger.py:/app/custom_zdr_logger.py
+      - ./litellm_config.yaml:/app/config.yaml
     command: ["--config", "/app/config.yaml", "--port", "4000", "--num_workers", "2"]
     depends_on:
       - redis

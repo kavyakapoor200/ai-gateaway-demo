@@ -33,3 +33,15 @@ Thumbs.db
 # Logs & temp files
 *.log
 scratch/
+
+# Node & package artifacts
+node_modules/
+dist/
+target/
+*.class
+*.jar
+*.app
+*.exe
+*.war
+TEST*.xml
+

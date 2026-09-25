@@ -21,9 +21,11 @@ import socket
 import asyncio
 from typing import Dict, Any
 
-# Ensure parent directory is on sys.path
+# Ensure parent, src, and scripts directories are on sys.path
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
+sys.path.insert(0, os.path.join(PROJECT_ROOT, "scripts"))
 sys.path.insert(0, PROJECT_ROOT)
 
 from custom_zdr_logger import ZDRAuditLogger
@@ -84,7 +86,11 @@ def test_schema_and_wal():
         if os.path.exists(p):
             os.remove(p)
 
-    schema_file = os.path.join(PROJECT_ROOT, "sqlite_schema.sql")
+    candidates = [
+        os.path.join(PROJECT_ROOT, "config", "sqlite_schema.sql"),
+        os.path.join(PROJECT_ROOT, "sqlite_schema.sql"),
+    ]
+    schema_file = next((p for p in candidates if os.path.exists(p)), candidates[0])
     conn = sqlite3.connect(TEST_DB_PATH)
     with open(schema_file, "r") as f:
         conn.executescript(f.read())

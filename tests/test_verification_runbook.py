@@ -22,7 +22,7 @@ import urllib.request
 import urllib.error
 from typing import Dict, Any, Tuple, Optional, List
 
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://localhost:4000")
 CPS_URL = os.environ.get("CPS_URL", "http://localhost:4001")
 MOCK_UPSTREAM_URL = os.environ.get("MOCK_UPSTREAM_URL", "http://localhost:8088")

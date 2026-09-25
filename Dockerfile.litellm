@@ -1,5 +1,0 @@
-FROM ghcr.io/berriai/litellm:main-latest
-COPY litellm_config.yaml /app/config.yaml
-COPY custom_zdr_logger.py /app/custom_zdr_logger.py
-COPY sqlite_schema.sql /app/sqlite_schema.sql
-RUN mkdir -p /app/data

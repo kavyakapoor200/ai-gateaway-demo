@@ -84,8 +84,14 @@ class ZDRAuditLogger(CustomLogger):
             cur = conn.cursor()
             cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='gateway_audit_ledger';")
             if not cur.fetchone():
-                schema_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sqlite_schema.sql")
-                if os.path.exists(schema_path):
+                candidates = [
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "sqlite_schema.sql"),
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config", "sqlite_schema.sql"),
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", "sqlite_schema.sql"),
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "sqlite_schema.sql")
+                ]
+                schema_path = next((p for p in candidates if os.path.exists(p)), None)
+                if schema_path:
                     with open(schema_path, "r") as f:
                         conn.executescript(f.read())
                 else:
@@ -301,54 +307,6 @@ class ZDRAuditLogger(CustomLogger):
         cost = ((prompt_tokens / 1_000_000.0) * p_cost) + ((completion_tokens / 1_000_000.0) * c_cost)
         return round(cost, 6)
 
-    async def async_pre_call_hook(
-        self,
-        user_api_key_dict: Any,
-        cache: Any,
-        data: dict,
-        call_type: str,
-    ) -> Optional[dict]:
-        """
-        Ingress Pre-Call Hook:
-        1. Scrubs secrets (AWS keys, API keys, email addresses) into [REDACTED].
-        2. Sniffs Git branch checkout/creation in messages and indexes bhash in Redis.
-        """
-        try:
-            messages = data.get("messages")
-            if messages and isinstance(messages, list):
-                for msg in messages:
-                    if isinstance(msg, dict) and "content" in msg and isinstance(msg["content"], str):
-                        content = msg["content"]
-                        # AWS Secret Key
-                        content = re.sub(r'(?i)AKIA[0-9A-Z]{16}', '[REDACTED]', content)
-                        # API Secret Keys (exclude proxy user bearer keys if not a secret)
-                        content = re.sub(r'sk-(?!agent-)[a-zA-Z0-9_\-]{20,}', '[REDACTED]', content)
-                        # Email Addresses
-                        content = re.sub(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', '[REDACTED]', content)
-                        msg["content"] = content
-
-                key_alias = None
-                if user_api_key_dict:
-                    if isinstance(user_api_key_dict, dict):
-                        key_alias = user_api_key_dict.get("key_alias") or user_api_key_dict.get("key_name") or user_api_key_dict.get("api_key")
-                    else:
-                        key_alias = getattr(user_api_key_dict, "key_alias", None) or getattr(user_api_key_dict, "key_name", None)
-                if not key_alias:
-                    key_alias = data.get("metadata", {}).get("user_api_key_alias") or data.get("user") or "sk-agent-developer"
-
-                prompt_sha256 = self._hash_payload(messages)
-                task_id = self._derive_task_id(key_alias, messages)
-
-                meta = data.setdefault("metadata", {})
-                meta["_zdr_prompt_sha256"] = prompt_sha256
-                meta["_zdr_task_id"] = task_id
-                meta["_zdr_key_alias"] = key_alias
-
-                tool_calls = data.get("tools") or data.get("tool_calls")
-                self._sniff_and_index_branch(messages, tool_calls, task_id)
-        except Exception as e:
-            print(f"[!] async_pre_call_hook error: {e}", file=sys.stderr)
-        return data
 
     def log_success_event(self, kwargs: Dict[str, Any], response_obj: Any, start_time: Any, end_time: Any) -> bool:
         """Logs successful request metadata into gateway_audit_ledger."""
@@ -681,64 +639,96 @@ class ZDRAuditLogger(CustomLogger):
         call_type: str,
     ) -> Optional[Dict[str, Any]]:
         """
-        Gateway Ingress Policy Enforcement Point (PEP) (SUB-POC-04).
-        Intercepts incoming requests and verifies declared tools against the key's whitelist.
-        Aborts with HTTP 403: tool_not_allowed on violation before LLM dispatch.
+        Gateway Ingress Policy Enforcement Point & ZDR Sanitizer:
+        1. (SUB-POC-04) Intercepts incoming requests and verifies declared tools against key's whitelist.
+           Aborts with HTTP 403: tool_not_allowed on violation before LLM dispatch.
+        2. Scrubs sensitive secrets (AWS keys, API keys, email addresses) into [REDACTED].
+        3. Sniffs in-flight Git branch operations and registers ephemeral bhash in Redis.
         """
         try:
+            # 1. Gate: MCP Tool Ingress PEP Whitelist Verification
             tools_requested = self._extract_tool_names(data)
-            if not tools_requested:
-                return data
+            if tools_requested:
+                whitelisted_tools = self._get_whitelisted_tools(user_api_key_dict)
+                if whitelisted_tools is not None:
+                    # Check for blocked tools on object_permission if present
+                    obj_perm = self._read_prop(user_api_key_dict, "object_permission")
+                    blocked_tools = set()
+                    if obj_perm:
+                        b_list = self._read_prop(obj_perm, "blocked_tools") or []
+                        if isinstance(b_list, (list, set, tuple)):
+                            blocked_tools.update(b_list)
 
-            whitelisted_tools = self._get_whitelisted_tools(user_api_key_dict)
-            if whitelisted_tools is None:
-                # No whitelist restriction for this caller
-                return data
+                    violating_tools = []
+                    for tool in tools_requested:
+                        if tool in blocked_tools:
+                            violating_tools.append(tool)
+                            continue
+                        # Match against whitelist (exact or wildcard)
+                        matched = any(tool == pat or fnmatch.fnmatch(tool, pat) for pat in whitelisted_tools)
+                        if not matched:
+                            violating_tools.append(tool)
 
-            # Check for blocked tools on object_permission if present
-            obj_perm = self._read_prop(user_api_key_dict, "object_permission")
-            blocked_tools = set()
-            if obj_perm:
-                b_list = self._read_prop(obj_perm, "blocked_tools") or []
-                if isinstance(b_list, (list, set, tuple)):
-                    blocked_tools.update(b_list)
+                    if violating_tools:
+                        key_alias = (
+                            self._read_prop(user_api_key_dict, "key_alias")
+                            or self._read_prop(user_api_key_dict, "key_name")
+                            or "unknown_key"
+                        )
+                        msg = (
+                            f"Tool execution policy violation: The following requested tool(s) "
+                            f"are not permitted for this API key: {sorted(violating_tools)}. "
+                            f"Allowed tools: {sorted(whitelisted_tools)}."
+                        )
+                        print(f"[!] MCP Ingress PEP Intercept: key='{key_alias}', violating={sorted(violating_tools)}", file=sys.stderr)
+                        raise HTTPException(
+                            status_code=403,
+                            detail={
+                                "error": {
+                                    "message": msg,
+                                    "type": "permission_error",
+                                    "param": "tools",
+                                    "code": "tool_not_allowed",
+                                    "violating_tools": sorted(violating_tools),
+                                    "allowed_tools": sorted(whitelisted_tools),
+                                    "key_alias": key_alias,
+                                }
+                            },
+                        )
 
-            violating_tools = []
-            for tool in tools_requested:
-                if tool in blocked_tools:
-                    violating_tools.append(tool)
-                    continue
-                # Match against whitelist (exact or wildcard)
-                matched = any(tool == pat or fnmatch.fnmatch(tool, pat) for pat in whitelisted_tools)
-                if not matched:
-                    violating_tools.append(tool)
+            # 2. Gate: Ingress Secret Redaction, Prompt Hashing & In-Flight Branch Sniffing
+            messages = data.get("messages")
+            if messages and isinstance(messages, list):
+                for msg in messages:
+                    if isinstance(msg, dict) and "content" in msg and isinstance(msg["content"], str):
+                        content = msg["content"]
+                        # AWS Secret Key
+                        content = re.sub(r'(?i)AKIA[0-9A-Z]{16}', '[REDACTED]', content)
+                        # API Secret Keys (exclude proxy user bearer keys if not a secret)
+                        content = re.sub(r'sk-(?!agent-)[a-zA-Z0-9_\-]{20,}', '[REDACTED]', content)
+                        # Email Addresses
+                        content = re.sub(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', '[REDACTED]', content)
+                        msg["content"] = content
 
-            if violating_tools:
-                key_alias = (
-                    self._read_prop(user_api_key_dict, "key_alias")
-                    or self._read_prop(user_api_key_dict, "key_name")
-                    or "unknown_key"
-                )
-                msg = (
-                    f"Tool execution policy violation: The following requested tool(s) "
-                    f"are not permitted for this API key: {sorted(violating_tools)}. "
-                    f"Allowed tools: {sorted(whitelisted_tools)}."
-                )
-                print(f"[!] MCP Ingress PEP Intercept: key='{key_alias}', violating={sorted(violating_tools)}", file=sys.stderr)
-                raise HTTPException(
-                    status_code=403,
-                    detail={
-                        "error": {
-                            "message": msg,
-                            "type": "permission_error",
-                            "param": "tools",
-                            "code": "tool_not_allowed",
-                            "violating_tools": sorted(violating_tools),
-                            "allowed_tools": sorted(whitelisted_tools),
-                            "key_alias": key_alias,
-                        }
-                    },
-                )
+                key_alias = None
+                if user_api_key_dict:
+                    if isinstance(user_api_key_dict, dict):
+                        key_alias = user_api_key_dict.get("key_alias") or user_api_key_dict.get("key_name") or user_api_key_dict.get("api_key")
+                    else:
+                        key_alias = getattr(user_api_key_dict, "key_alias", None) or getattr(user_api_key_dict, "key_name", None)
+                if not key_alias:
+                    key_alias = data.get("metadata", {}).get("user_api_key_alias") or data.get("user") or "sk-agent-developer"
+
+                prompt_sha256 = self._hash_payload(messages)
+                task_id = self._derive_task_id(key_alias, messages)
+
+                meta = data.setdefault("metadata", {})
+                meta["_zdr_prompt_sha256"] = prompt_sha256
+                meta["_zdr_task_id"] = task_id
+                meta["_zdr_key_alias"] = key_alias
+
+                tool_calls = data.get("tools") or data.get("tool_calls")
+                self._sniff_and_index_branch(messages, tool_calls, task_id)
         except HTTPException:
             raise
         except Exception as e:

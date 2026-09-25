@@ -65,36 +65,55 @@ The system runs as an orchestrated 6-container Docker Compose stack:
 
 ```
 PoCs/AI_Gateway/
-├── client_templates/         # Production client integration manifests
-│   ├── claude_code.json      # Claude Code CLI configuration (~/.claude/config.json)
-│   ├── claude_env.sh         # Claude Code environment exports
-│   ├── openai_sdk_example.py # Runnable OpenAI Python SDK client example
-│   ├── mcp_servers.json      # Model Context Protocol (MCP) server bindings
-│   ├── generic_agent_env.sh  # OpenAI-compatible generic agent environment variables
-│   └── README.md             # Client integration guide
-├── data/                     # Host-mounted SQLite database directory
-│   ├── gateway.db            # Primary audit ledger database
-│   ├── gateway.db-wal        # SQLite Write-Ahead Log
-│   └── gateway.db-shm        # SQLite shared memory index
-├── docs/                     # Specifications and architectural blueprints
+├── config/                      # Configuration files & declarative schemas
+│   ├── litellm_config.yaml      # LiteLLM routing, fallbacks, OTel & metrics callbacks
+│   ├── prometheus.yml           # Prometheus metrics scraping configuration
+│   ├── sqlite_schema.sql        # Single-table SQLite audit ledger bootstrap script
+│   └── grafana/                 # Grafana datasources & dashboard provisioning
+│       └── provisioning/
+├── docker/                      # Dedicated container build manifests
+│   ├── Dockerfile.litellm       # LiteLLM gateway proxy image
+│   ├── Dockerfile.webhook       # CPS companion webhook service image
+│   ├── Dockerfile.mock          # Zero-cost offline mock server image
+│   ├── Dockerfile.prometheus   # Prometheus timeseries scraper image
+│   └── Dockerfile.grafana      # Pre-provisioned Grafana observability image
+├── src/                         # Core gateway components & extensions
+│   ├── custom_zdr_logger.py     # In-RAM SHA-256 calculator, task_id deriver & Ingress PEP
+│   ├── cps_webhook_server.py    # Companion PR webhook listener, web dashboard & /metrics
+│   └── mock_upstream_server.py  # Zero-cost offline OpenAI mock server on :8080
+├── scripts/                     # Developer operations, CLI tools & runners
+│   ├── setup.sh                 # Environment bootstrap and key provisioning script
+│   ├── verify.sh                # Automated test runner script
+│   ├── mock_local_pr.py         # Local Git PR lifecycle simulator CLI
+│   └── live_agent_run.py        # Autonomous agent demonstration script
+├── client_templates/            # Production client integration manifests
+│   ├── claude_code.json         # Claude Code CLI configuration (~/.claude/config.json)
+│   ├── claude_env.sh            # Claude Code environment exports
+│   ├── openai_sdk_example.py    # Runnable OpenAI Python SDK client example
+│   ├── mcp_servers.json         # Model Context Protocol (MCP) server bindings
+│   ├── generic_agent_env.sh     # OpenAI-compatible generic agent environment variables
+│   └── README.md                # Client integration guide
+├── tests/                       # Automated test suites
+│   ├── test_phase1.py           # Phase 1 test suite (Schema, Ledger, ZDR)
+│   ├── test_phase2.py           # Phase 2 test suite (CPS Webhook, PR Reconciliation)
+│   ├── test_phase3.py           # Phase 3 test suite (RBAC, Rate Limits, Fallbacks)
+│   ├── test_mcp_interrupt.py    # SUB-POC-04 MCP Tool Interrupt Ingress PEP suite
+│   └── test_verification_runbook.py # Comprehensive 7-Step Verification Suite
+├── docs/                        # Architectural specifications
 │   ├── SPEC_AI_GATEWAY_LOCAL_POC.md
 │   └── sub_specs/
 │       ├── SUB_POC_01_CORE_LITELLM_RBAC_AND_REDIS.md
 │       ├── SUB_POC_02_SQLITE_OBSERVABILITY_AND_ZDR.md
-│       └── SUB_POC_03_CONFIGS_MOCK_FILES_AND_EXTRAS.md
-├── docker-compose.yml        # 6-container production stack
-├── litellm_config.yaml       # LiteLLM routing, fallbacks, OTel & native regex guardrails
-├── sqlite_schema.sql         # Single-table SQLite audit ledger bootstrap script
-├── custom_zdr_logger.py      # In-RAM SHA-256 calculator, task_id deriver & branch sniffer
-├── cps_webhook_server.py     # Standalone companion webhook listener & web dashboard on :4001
-├── live_agent_run.py         # Autonomous agent demonstration script
-├── mock_local_pr.py          # Local Git PR lifecycle simulator CLI
-├── mock_upstream_server.py   # Zero-cost offline OpenAI mock server on :8080
-├── setup.sh                  # One-click bootstrap and provisioning script
-├── test_verification_runbook.py # Automated 7-Step Verification Suite (31 assertions)
-├── verify.sh                 # Verification test runner script
-├── .env.example              # Environment variables template
-└── README.md                 # This document
+│       ├── SUB_POC_03_CONFIGS_MOCK_FILES_AND_EXTRAS.md
+│       └── SUB_POC_04_MCP_INTERRUPT_INGRESS_PEP.md
+├── data/                        # Host-mounted SQLite database directory
+│   └── gateway.db               # Primary audit ledger database
+├── docker-compose.yml           # 8-container production orchestration stack
+├── Makefile                     # Standard developer commands (make up, make test, etc.)
+├── setup.sh                     # Quickstart root bootstrap wrapper
+├── verify.sh                    # Quickstart root verification wrapper
+├── .env.example                 # Environment variables template
+└── README.md                    # This document
 ```
 
 ---

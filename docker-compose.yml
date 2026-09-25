@@ -5,7 +5,7 @@ services:
   litellm:
     build:
       context: .
-      dockerfile: Dockerfile.litellm
+      dockerfile: docker/Dockerfile.litellm
     container_name: litellm_gateway
     restart: unless-stopped
     ports:
@@ -27,8 +27,6 @@ services:
       - "host.docker.internal:host-gateway"
     volumes:
       - gateway_data:/app/data
-      - ./custom_zdr_logger.py:/app/custom_zdr_logger.py
-      - ./litellm_config.yaml:/app/config.yaml
     command: ["--config", "/app/config.yaml", "--port", "4000", "--num_workers", "2"]
     depends_on:
       - redis
@@ -82,7 +80,7 @@ services:
   cps_webhook:
     build:
       context: .
-      dockerfile: Dockerfile.webhook
+      dockerfile: docker/Dockerfile.webhook
     container_name: gateway_cps_webhook
     restart: unless-stopped
     working_dir: /app
@@ -105,7 +103,7 @@ services:
   mock_upstream:
     build:
       context: .
-      dockerfile: Dockerfile.mock
+      dockerfile: docker/Dockerfile.mock
     container_name: gateway_mock_upstream
     restart: unless-stopped
     working_dir: /app
@@ -119,7 +117,7 @@ services:
   prometheus:
     build:
       context: .
-      dockerfile: Dockerfile.prometheus
+      dockerfile: docker/Dockerfile.prometheus
     container_name: gateway_prometheus
     restart: unless-stopped
     ports:
@@ -134,7 +132,7 @@ services:
   grafana:
     build:
       context: .
-      dockerfile: Dockerfile.grafana
+      dockerfile: docker/Dockerfile.grafana
     container_name: gateway_grafana
     restart: unless-stopped
     ports:
@@ -151,4 +149,3 @@ services:
 volumes:
   pgdata:
   gateway_data:
-

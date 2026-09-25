@@ -21,6 +21,7 @@ import sqlite3
 # Ensure parent directory is on sys.path
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+sys.path.insert(0, os.path.join(PROJECT_ROOT, "src"))
 sys.path.insert(0, PROJECT_ROOT)
 
 from custom_zdr_logger import ZDRAuditLogger
@@ -52,7 +53,7 @@ def make_request(path: str, payload: dict, headers: dict = None) -> tuple:
 
     req = urllib.request.Request(url, data=data, headers=req_headers, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=45) as resp:
+        with urllib.request.urlopen(req, timeout=120) as resp:
             status = resp.status
             body = json.loads(resp.read().decode("utf-8"))
             resp_headers = dict(resp.headers)

@@ -5,7 +5,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-cd "$SCRIPT_DIR"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$PROJECT_ROOT"
 
 MASTER_KEY="${LITELLM_MASTER_KEY:-sk-enterprise-master-secret-key-2026}"
 GATEWAY_URL="http://localhost:4000"
@@ -134,7 +135,7 @@ show_summary() {
     echo "• Swagger API Docs:      $GATEWAY_URL/docs"
     echo "• Jaeger Distributed UI: http://localhost:16686"
     echo "• CPS Webhook Listener:  $CPS_URL/webhooks/github"
-    echo "• SQLite Database:       $SCRIPT_DIR/data/gateway.db"
+    echo "• SQLite Database:       $PROJECT_ROOT/data/gateway.db"
     echo "=============================================================================="
     echo "Test Commands:"
     echo "1. Test Allowed Request:"
@@ -151,27 +152,60 @@ show_summary() {
     echo "=============================================================================="
 }
 
-case "${1:-all}" in
-    --init-db)
+wait_for_user() {
+    if [ "${NO_PAUSE:-false}" = "true" ] || [ "${CI:-false}" = "true" ]; then
+        return 0
+    fi
+    echo ""
+    if [ -t 0 ]; then
+        read -rp "Press [Enter] to exit..." _ || true
+    elif [ -e /dev/tty ]; then
+        read -rp "Press [Enter] to exit..." _ </dev/tty 2>/dev/null || true
+    fi
+}
+
+NO_PAUSE="${NO_PAUSE:-false}"
+ACTION="all"
+
+for arg in "$@"; do
+    case "$arg" in
+        --no-pause|--non-interactive)
+            NO_PAUSE="true"
+            ;;
+        --init-db|--up|--provision-keys|--summary|--all|all)
+            ACTION="${arg#--}"
+            ;;
+        -h|--help)
+            echo "Usage: $0 [--init-db | --up | --provision-keys | --summary | --all] [--no-pause]"
+            exit 0
+            ;;
+        *)
+            echo "Usage: $0 [--init-db | --up | --provision-keys | --summary | --all] [--no-pause]"
+            exit 1
+            ;;
+    esac
+done
+
+case "$ACTION" in
+    init-db)
         ;;
-    --up)
+    up)
         start_docker
         ;;
-    --provision-keys)
+    provision-keys)
         provision_keys
         ;;
-    --summary)
+    summary)
         show_summary
+        wait_for_user
         ;;
-    all|--all)
+    all)
         if command -v docker >/dev/null 2>&1; then
             start_docker
             provision_keys
         fi
         show_summary
-        ;;
-    *)
-        echo "Usage: $0 [--init-db | --up | --provision-keys | --summary | --all]"
-        exit 1
+        wait_for_user
         ;;
 esac
+

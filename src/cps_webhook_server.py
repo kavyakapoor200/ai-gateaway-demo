@@ -61,6 +61,15 @@ def get_db_stats() -> Dict[str, Any]:
         "verified_tasks": 0,
         "total_spend": 0.0,
         "avg_cps": 0.0,
+        "fully_loaded_cps": 0.0,
+        "success_rate": 0.0,
+        "spend_by_outcome": {
+            "merged": 0.0,
+            "closed_unmerged": 0.0,
+            "pending": 0.0,
+            "blocked_by_policy": 0.0,
+            "other": 0.0
+        },
         "zdr_status": "UNKNOWN"
     }
     try:
@@ -75,7 +84,7 @@ def get_db_stats() -> Dict[str, Any]:
             stats["total_records"] = zdr_row["total_records"] or 0
             stats["zdr_status"] = zdr_row["compliance_status"] or "COMPLIANT"
 
-        # CPS summaries
+        # 1. Existing Nominal CPS (kept unchanged from v_coding_cps_summary as instructed)
         cur.execute("""
             SELECT 
                 COUNT(*) AS total_tasks,
@@ -85,11 +94,97 @@ def get_db_stats() -> Dict[str, Any]:
             FROM v_coding_cps_summary
         """)
         s_row = cur.fetchone()
+        nominal_avg_cps = 0.0
         if s_row:
-            stats["total_tasks"] = s_row["total_tasks"] or 0
-            stats["verified_tasks"] = s_row["verified_tasks"] or 0
-            stats["total_spend"] = s_row["total_spend"] or 0.0
-            stats["avg_cps"] = s_row["avg_cps"] or 0.0
+            nominal_avg_cps = s_row["avg_cps"] or 0.0
+        stats["avg_cps"] = nominal_avg_cps
+
+        # Total spend across all ledger records (including any untracked rows)
+        cur.execute("SELECT ROUND(COALESCE(SUM(cost_usd), 0.0), 6) AS total_ledger_spend FROM gateway_audit_ledger")
+        t_row = cur.fetchone()
+        if t_row and t_row["total_ledger_spend"] is not None:
+            stats["total_spend"] = float(t_row["total_ledger_spend"])
+
+        # 2. New Task-Level Query (1 task = 1 unit, spend summed per task_id, outcome precedence)
+        # Precedence: merged > closed_unmerged > blocked_by_policy > failed > pending
+        # 'failed' mapped into 'closed_unmerged' as decided.
+        cur.execute("""
+            WITH task_aggregates AS (
+                SELECT 
+                    task_id,
+                    SUM(cost_usd) AS task_spend,
+                    CASE
+                        WHEN SUM(CASE WHEN task_outcome = 'verified_success' THEN 1 ELSE 0 END) > 0 THEN 'merged'
+                        WHEN SUM(CASE WHEN task_outcome = 'unmerged_closed' THEN 1 ELSE 0 END) > 0 THEN 'closed_unmerged'
+                        WHEN SUM(CASE WHEN task_outcome = 'tool_policy_rejected' THEN 1 ELSE 0 END) > 0 THEN 'blocked_by_policy'
+                        WHEN SUM(CASE WHEN task_outcome = 'failed' THEN 1 ELSE 0 END) > 0 THEN 'closed_unmerged'
+                        WHEN SUM(CASE WHEN task_outcome = 'pending' THEN 1 ELSE 0 END) > 0 THEN 'pending'
+                        ELSE 'other'
+                    END AS task_resolved_outcome
+                FROM gateway_audit_ledger
+                WHERE task_id IS NOT NULL
+                GROUP BY task_id
+            )
+            SELECT 
+                COUNT(*) AS total_tasks_task_level,
+                SUM(CASE WHEN task_resolved_outcome = 'merged' THEN 1 ELSE 0 END) AS merged_tasks_count,
+                ROUND(SUM(task_spend), 6) AS all_task_spend,
+                ROUND(SUM(CASE WHEN task_resolved_outcome = 'merged' THEN task_spend ELSE 0.0 END), 6) AS spend_merged,
+                ROUND(SUM(CASE WHEN task_resolved_outcome = 'closed_unmerged' THEN task_spend ELSE 0.0 END), 6) AS spend_closed_unmerged,
+                ROUND(SUM(CASE WHEN task_resolved_outcome = 'pending' THEN task_spend ELSE 0.0 END), 6) AS spend_pending,
+                ROUND(SUM(CASE WHEN task_resolved_outcome = 'blocked_by_policy' THEN task_spend ELSE 0.0 END), 6) AS spend_blocked_by_policy,
+                ROUND(SUM(CASE WHEN task_resolved_outcome = 'other' THEN task_spend ELSE 0.0 END), 6) AS spend_other
+            FROM task_aggregates
+        """)
+        t_agg = cur.fetchone()
+        
+        total_tasks = 0
+        merged_tasks = 0
+        all_task_spend = 0.0
+        spend_merged = 0.0
+        spend_closed_unmerged = 0.0
+        spend_pending = 0.0
+        spend_blocked_by_policy = 0.0
+        spend_other = 0.0
+
+        if t_agg:
+            total_tasks = t_agg["total_tasks_task_level"] or 0
+            merged_tasks = t_agg["merged_tasks_count"] or 0
+            all_task_spend = float(t_agg["all_task_spend"] or 0.0)
+            spend_merged = float(t_agg["spend_merged"] or 0.0)
+            spend_closed_unmerged = float(t_agg["spend_closed_unmerged"] or 0.0)
+            spend_pending = float(t_agg["spend_pending"] or 0.0)
+            spend_blocked_by_policy = float(t_agg["spend_blocked_by_policy"] or 0.0)
+            spend_other = float(t_agg["spend_other"] or 0.0)
+
+        # Check for untracked spend (task_id IS NULL) to ensure buckets strictly sum to total spend
+        cur.execute("SELECT ROUND(COALESCE(SUM(cost_usd), 0.0), 6) AS untracked_spend FROM gateway_audit_ledger WHERE task_id IS NULL")
+        u_row = cur.fetchone()
+        untracked = float(u_row["untracked_spend"]) if u_row and u_row["untracked_spend"] else 0.0
+        spend_other = round(spend_other + untracked, 6)
+
+        stats["total_tasks"] = total_tasks
+        stats["verified_tasks"] = merged_tasks
+        
+        # Fully-loaded CPS: all task spend / merged tasks
+        if merged_tasks > 0:
+            stats["fully_loaded_cps"] = round(all_task_spend / merged_tasks, 6)
+        else:
+            stats["fully_loaded_cps"] = 0.0
+
+        # Success rate: merged tasks / total tasks (0.0 - 1.0 ratio)
+        if total_tasks > 0:
+            stats["success_rate"] = round(merged_tasks / total_tasks, 4)
+        else:
+            stats["success_rate"] = 0.0
+
+        stats["spend_by_outcome"] = {
+            "merged": spend_merged,
+            "closed_unmerged": spend_closed_unmerged,
+            "pending": spend_pending,
+            "blocked_by_policy": spend_blocked_by_policy,
+            "other": spend_other
+        }
             
         conn.close()
     except Exception as e:
@@ -576,14 +671,83 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="metric-sub">Real-Time Micro-Cent Token Card</div>
       </div>
       <div class="metric-card" style="--card-accent: var(--accent-amber);">
-        <div class="metric-label">Average Cost / Success</div>
+        <div class="metric-label">Nominal CPS (Merged Only)</div>
         <div class="metric-value" id="kpi-avg-cps" style="color: var(--accent-amber);">$0.00</div>
-        <div class="metric-sub">Cost Per Successful Task (CPS)</div>
+        <div class="metric-sub">Cost / Successful Task</div>
+      </div>
+      <div class="metric-card" style="--card-accent: #f43f5e;">
+        <div class="metric-label">Fully-Loaded CPS</div>
+        <div class="metric-value" id="kpi-fully-loaded-cps" style="color: #fb7185;">$0.00</div>
+        <div class="metric-sub" id="kpi-fully-loaded-sub">All Task Spend / Merged Tasks</div>
+      </div>
+      <div class="metric-card" style="--card-accent: #38bdf8;">
+        <div class="metric-label">Task Success Rate</div>
+        <div class="metric-value" id="kpi-success-rate" style="color: #38bdf8;">0.0%</div>
+        <div class="metric-sub" id="kpi-success-rate-sub">0 of 0 tasks merged</div>
       </div>
       <div class="metric-card" style="--card-accent: var(--accent-emerald);">
         <div class="metric-label">ZDR Invariant Status</div>
         <div class="metric-value" id="kpi-zdr-status" style="font-size: 1.125rem; font-weight: 600; color: var(--accent-emerald); padding-top: 8px;">100% COMPLIANT</div>
         <div class="metric-sub">0 Bytes Plaintext Persisted</div>
+      </div>
+    </div>
+
+    <!-- Executive Section: Where the Money Went Breakdown -->
+    <div class="section-box">
+      <div class="section-header">
+        <div class="section-title">
+          <span>Where the Money Went (Capital Allocation)</span>
+          <span class="badge-count" id="badge-spend-total">$0.00 Total</span>
+        </div>
+        <div style="font-size: 0.8125rem; color: var(--text-dim);">Financial breakdown by task outcome: Merged vs Closed Unmerged vs Pending vs Policy Blocked</div>
+      </div>
+      <div style="padding: 20px 24px;">
+        <!-- Visual Progress Bar -->
+        <div id="spend-bar" style="display: flex; height: 14px; border-radius: 7px; overflow: hidden; background: rgba(255,255,255,0.06); margin-bottom: 20px;">
+          <div id="bar-merged" style="background: #10b981; width: 0%; transition: width 0.4s ease;" title="Merged"></div>
+          <div id="bar-closed" style="background: #f43f5e; width: 0%; transition: width 0.4s ease;" title="Closed Unmerged"></div>
+          <div id="bar-pending" style="background: #f59e0b; width: 0%; transition: width 0.4s ease;" title="Pending"></div>
+          <div id="bar-blocked" style="background: #8b5cf6; width: 0%; transition: width 0.4s ease;" title="Blocked by Policy"></div>
+          <div id="bar-other" style="background: #64748b; width: 0%; transition: width 0.4s ease;" title="Other"></div>
+        </div>
+        <!-- Metric Grid for Categories -->
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px;">
+          <div style="background: rgba(16, 185, 129, 0.08); border: 1px solid rgba(16, 185, 129, 0.2); border-radius: 10px; padding: 12px 16px;">
+            <div style="display: flex; align-items: center; gap: 8px; font-size: 0.8125rem; color: #34d399; font-weight: 600;">
+              <span style="width: 8px; height: 8px; border-radius: 50%; background: #10b981;"></span> Merged (Productive)
+            </div>
+            <div id="spend-val-merged" style="font-size: 1.25rem; font-weight: 700; color: #ffffff; margin-top: 6px;">$0.0000</div>
+            <div id="spend-pct-merged" style="font-size: 0.75rem; color: var(--text-dim);">0.0% of total spend</div>
+          </div>
+          <div style="background: rgba(244, 63, 94, 0.08); border: 1px solid rgba(244, 63, 94, 0.2); border-radius: 10px; padding: 12px 16px;">
+            <div style="display: flex; align-items: center; gap: 8px; font-size: 0.8125rem; color: #fb7185; font-weight: 600;">
+              <span style="width: 8px; height: 8px; border-radius: 50%; background: #f43f5e;"></span> Closed Unmerged (Waste)
+            </div>
+            <div id="spend-val-closed" style="font-size: 1.25rem; font-weight: 700; color: #ffffff; margin-top: 6px;">$0.0000</div>
+            <div id="spend-pct-closed" style="font-size: 0.75rem; color: var(--text-dim);">0.0% of total spend</div>
+          </div>
+          <div style="background: rgba(245, 158, 11, 0.08); border: 1px solid rgba(245, 158, 11, 0.2); border-radius: 10px; padding: 12px 16px;">
+            <div style="display: flex; align-items: center; gap: 8px; font-size: 0.8125rem; color: #fbbf24; font-weight: 600;">
+              <span style="width: 8px; height: 8px; border-radius: 50%; background: #f59e0b;"></span> Pending (In-Flight)
+            </div>
+            <div id="spend-val-pending" style="font-size: 1.25rem; font-weight: 700; color: #ffffff; margin-top: 6px;">$0.0000</div>
+            <div id="spend-pct-pending" style="font-size: 0.75rem; color: var(--text-dim);">0.0% of total spend</div>
+          </div>
+          <div style="background: rgba(139, 92, 246, 0.08); border: 1px solid rgba(139, 92, 246, 0.2); border-radius: 10px; padding: 12px 16px;">
+            <div style="display: flex; align-items: center; gap: 8px; font-size: 0.8125rem; color: #a78bfa; font-weight: 600;">
+              <span style="width: 8px; height: 8px; border-radius: 50%; background: #8b5cf6;"></span> Blocked by Policy
+            </div>
+            <div id="spend-val-blocked" style="font-size: 1.25rem; font-weight: 700; color: #ffffff; margin-top: 6px;">$0.0000</div>
+            <div id="spend-pct-blocked" style="font-size: 0.75rem; color: var(--text-dim);">0.0% of total spend</div>
+          </div>
+          <div style="background: rgba(100, 116, 139, 0.08); border: 1px solid rgba(100, 116, 139, 0.2); border-radius: 10px; padding: 12px 16px;">
+            <div style="display: flex; align-items: center; gap: 8px; font-size: 0.8125rem; color: #94a3b8; font-weight: 600;">
+              <span style="width: 8px; height: 8px; border-radius: 50%; background: #64748b;"></span> Other / Fallback
+            </div>
+            <div id="spend-val-other" style="font-size: 1.25rem; font-weight: 700; color: #ffffff; margin-top: 6px;">$0.0000</div>
+            <div id="spend-pct-other" style="font-size: 0.75rem; color: var(--text-dim);">0.0% of total spend</div>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -694,7 +858,67 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         document.getElementById('kpi-verified-tasks').textContent = statsRes.verified_tasks || 0;
         document.getElementById('kpi-total-spend').textContent = `$${(statsRes.total_spend || 0).toFixed(4)}`;
         document.getElementById('kpi-avg-cps').textContent = statsRes.avg_cps ? `$${statsRes.avg_cps.toFixed(4)}` : '$0.0000';
+        
+        // Fully-Loaded CPS
+        const fullyLoadedEl = document.getElementById('kpi-fully-loaded-cps');
+        const fullyLoadedSub = document.getElementById('kpi-fully-loaded-sub');
+        if ((statsRes.verified_tasks || 0) === 0) {
+          fullyLoadedEl.textContent = 'N/A';
+          fullyLoadedSub.textContent = (statsRes.total_spend || 0) > 0 
+            ? `$${statsRes.total_spend.toFixed(4)} unmerged spend (0 merged)` 
+            : '0 merged tasks';
+        } else {
+          fullyLoadedEl.textContent = `$${(statsRes.fully_loaded_cps || 0).toFixed(4)}`;
+          fullyLoadedSub.textContent = `${statsRes.verified_tasks} merged of ${statsRes.total_tasks} total`;
+        }
+
+        // Success Rate
+        const successRateEl = document.getElementById('kpi-success-rate');
+        const successRateSub = document.getElementById('kpi-success-rate-sub');
+        const ratePct = ((statsRes.success_rate || 0) * 100).toFixed(1);
+        successRateEl.textContent = `${ratePct}%`;
+        successRateSub.textContent = `${statsRes.verified_tasks || 0} of ${statsRes.total_tasks || 0} tasks merged`;
+
         document.getElementById('kpi-zdr-status').textContent = statsRes.zdr_status.includes('100%') ? '100% COMPLIANT' : statsRes.zdr_status;
+
+        // Where the Money Went Breakdown
+        const sByO = statsRes.spend_by_outcome || {};
+        const totalSp = statsRes.total_spend || 0.000001; // Avoid divide by zero
+        const mSpend = sByO.merged || 0;
+        const cSpend = sByO.closed_unmerged || 0;
+        const pSpend = sByO.pending || 0;
+        const bSpend = sByO.blocked_by_policy || 0;
+        const oSpend = sByO.other || 0;
+
+        document.getElementById('badge-spend-total').textContent = `$${(statsRes.total_spend || 0).toFixed(4)} Total`;
+
+        // Progress bar widths
+        const mPct = (statsRes.total_spend || 0) > 0 ? (mSpend / totalSp) * 100 : 0;
+        const cPct = (statsRes.total_spend || 0) > 0 ? (cSpend / totalSp) * 100 : 0;
+        const pPct = (statsRes.total_spend || 0) > 0 ? (pSpend / totalSp) * 100 : 0;
+        const bPct = (statsRes.total_spend || 0) > 0 ? (bSpend / totalSp) * 100 : 0;
+        const oPct = (statsRes.total_spend || 0) > 0 ? (oSpend / totalSp) * 100 : 0;
+
+        document.getElementById('bar-merged').style.width = `${mPct}%`;
+        document.getElementById('bar-closed').style.width = `${cPct}%`;
+        document.getElementById('bar-pending').style.width = `${pPct}%`;
+        document.getElementById('bar-blocked').style.width = `${bPct}%`;
+        document.getElementById('bar-other').style.width = `${oPct}%`;
+
+        document.getElementById('spend-val-merged').textContent = `$${mSpend.toFixed(4)}`;
+        document.getElementById('spend-pct-merged').textContent = `${mPct.toFixed(1)}% of total spend`;
+
+        document.getElementById('spend-val-closed').textContent = `$${cSpend.toFixed(4)}`;
+        document.getElementById('spend-pct-closed').textContent = `${cPct.toFixed(1)}% of total spend`;
+
+        document.getElementById('spend-val-pending').textContent = `$${pSpend.toFixed(4)}`;
+        document.getElementById('spend-pct-pending').textContent = `${pPct.toFixed(1)}% of total spend`;
+
+        document.getElementById('spend-val-blocked').textContent = `$${bSpend.toFixed(4)}`;
+        document.getElementById('spend-pct-blocked').textContent = `${bPct.toFixed(1)}% of total spend`;
+
+        document.getElementById('spend-val-other').textContent = `$${oSpend.toFixed(4)}`;
+        document.getElementById('spend-pct-other').textContent = `${oPct.toFixed(1)}% of total spend`;
 
         // 2. Render CPS Table
         document.getElementById('badge-cps-count').textContent = `${cpsRes.length} Tasks`;
@@ -708,6 +932,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               statusBadge = '<span class="status-badge status-success">✓ verified_success</span>';
             } else if (t.task_outcome === 'unmerged_closed') {
               statusBadge = '<span class="status-badge status-closed">✕ unmerged_closed</span>';
+            } else if (t.task_outcome === 'tool_policy_rejected') {
+              statusBadge = '<span class="status-badge" style="background:rgba(139,92,246,0.15); color:#a78bfa; border:1px solid rgba(139,92,246,0.3);">⊘ blocked_policy</span>';
+            } else if (t.task_outcome === 'failed') {
+              statusBadge = '<span class="status-badge status-closed">⚠ failed</span>';
             }
             const cpsText = t.final_cps_usd !== null 
               ? `<strong style="color:var(--accent-emerald);">$${Number(t.final_cps_usd).toFixed(6)}</strong>`
@@ -849,6 +1077,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         elif self.path in ("/metrics", "/metrics/"):
             stats = get_db_stats()
+            s_by_o = stats.get("spend_by_outcome", {})
             prom_lines = [
                 "# HELP ai_gateway_tasks_total Total coding tasks recorded by gateway",
                 "# TYPE ai_gateway_tasks_total gauge",
@@ -862,6 +1091,19 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 "# HELP ai_gateway_avg_cps_usd Average Cost Per Successful Task (CPS) in USD",
                 "# TYPE ai_gateway_avg_cps_usd gauge",
                 f"ai_gateway_avg_cps_usd {stats.get('avg_cps', 0.0)}",
+                "# HELP ai_gateway_fully_loaded_cps_usd Fully-loaded Cost Per Successful Task (all spend / merged tasks) in USD",
+                "# TYPE ai_gateway_fully_loaded_cps_usd gauge",
+                f"ai_gateway_fully_loaded_cps_usd {stats.get('fully_loaded_cps', 0.0)}",
+                "# HELP ai_gateway_task_success_ratio Ratio of merged tasks over total tasks (0.0 - 1.0)",
+                "# TYPE ai_gateway_task_success_ratio gauge",
+                f"ai_gateway_task_success_ratio {stats.get('success_rate', 0.0)}",
+                "# HELP ai_gateway_spend_by_outcome_usd Gateway spend categorized by lifecycle outcome",
+                "# TYPE ai_gateway_spend_by_outcome_usd gauge",
+                f'ai_gateway_spend_by_outcome_usd{{outcome="merged"}} {s_by_o.get("merged", 0.0)}',
+                f'ai_gateway_spend_by_outcome_usd{{outcome="closed_unmerged"}} {s_by_o.get("closed_unmerged", 0.0)}',
+                f'ai_gateway_spend_by_outcome_usd{{outcome="pending"}} {s_by_o.get("pending", 0.0)}',
+                f'ai_gateway_spend_by_outcome_usd{{outcome="blocked_by_policy"}} {s_by_o.get("blocked_by_policy", 0.0)}',
+                f'ai_gateway_spend_by_outcome_usd{{outcome="other"}} {s_by_o.get("other", 0.0)}',
                 "# HELP ai_gateway_zdr_compliant Zero Data Retention Invariant Compliance (1 = 100% compliant)",
                 "# TYPE ai_gateway_zdr_compliant gauge",
                 f"ai_gateway_zdr_compliant {1 if '100%' in stats.get('zdr_status', '') else 0}"

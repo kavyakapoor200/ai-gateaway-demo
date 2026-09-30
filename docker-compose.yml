@@ -23,10 +23,13 @@ services:
       - OTEL_SERVICE_NAME=litellm
       - OTEL_BSP_SCHEDULE_DELAY_MILLIS=500
       - DB_PATH=/app/data/gateway.db
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - RESEND_API_KEY=${RESEND_API_KEY}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
       - gateway_data:/app/data
+      - ./config/specs:/app/specs:ro
     command: ["--config", "/app/config.yaml", "--port", "4000", "--num_workers", "2"]
     depends_on:
       - redis
@@ -68,9 +71,9 @@ services:
     container_name: gateway_jaeger
     restart: unless-stopped
     ports:
-      - "16686:16686" # Web UI (http://localhost:16686)
-      - "4317:4317"   # OTLP gRPC receiver
-      - "4318:4318"   # OTLP HTTP receiver
+      - "16687:16686" # Web UI (http://localhost:16687)
+      - "4319:4317"   # OTLP gRPC receiver
+      - "4320:4318"   # OTLP HTTP receiver
     environment:
       - COLLECTOR_OTLP_ENABLED=true
 

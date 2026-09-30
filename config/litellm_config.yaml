@@ -134,3 +134,32 @@ litellm_settings:
   turn_off_message_logging: true
   require_auth_for_metrics_endpoint: false
   callbacks: ["otel", "prometheus", "custom_zdr_logger.zdr_audit_logger"]
+
+# ==============================================================================
+# Model Context Protocol (MCP) Gateway Configuration
+# OpenAPI -> MCP tool exposure via native LiteLLM proxy
+# ==============================================================================
+mcp_servers:
+  github_mcp:
+    url: "https://api.github.com"
+    spec_path: "/app/specs/github_openapi.json"
+    auth_type: "bearer_token"
+    auth_value: os.environ/GITHUB_TOKEN
+    allowed_tools:
+      - "repos_get"
+      - "issues_list_for_repo"
+      - "issues_get"
+      - "issues_create"
+    static_headers:
+      User-Agent: "LiteLLM-Gateway"
+      Accept: "application/vnd.github+json"
+
+  resend_mcp:
+    url: "https://api.resend.com"
+    spec_path: "/app/specs/resend_openapi.json"
+    auth_type: "bearer_token"
+    auth_value: os.environ/RESEND_API_KEY
+    allowed_tools:
+      - "emails_send"
+      - "emails_get"
+      - "emails_list"

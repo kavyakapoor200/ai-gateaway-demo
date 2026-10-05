@@ -14,10 +14,17 @@ import urllib.request
 import urllib.error
 
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://localhost:4000")
-MASTER_KEY = os.environ.get("LITELLM_MASTER_KEY", "sk-enterprise-master-secret-key-2026")
+API_KEY = os.environ.get("LITELLM_API_KEY") or os.environ.get("MCP_BRIDGE_API_KEY")
 
-SERVER_NAME = sys.argv[1] if len(sys.argv) > 1 else "github_mcp"
-TARGET_URL = f"{GATEWAY_URL}/{SERVER_NAME}/mcp"
+if not API_KEY:
+    sys.stderr.write(
+        "[mcp_bridge:error] Missing required API key! "
+        "Please set LITELLM_API_KEY (or MCP_BRIDGE_API_KEY) in your environment.\n"
+    )
+    sys.exit(1)
+
+SERVER_NAME = sys.argv[1] if len(sys.argv) > 1 else None
+TARGET_URL = f"{GATEWAY_URL}/{SERVER_NAME}/mcp" if SERVER_NAME else f"{GATEWAY_URL}/mcp"
 
 
 def log_debug(msg: str):
@@ -40,7 +47,7 @@ def forward_request(raw_json: str):
         headers={
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
-            "Authorization": f"Bearer {MASTER_KEY}"
+            "Authorization": f"Bearer {API_KEY}"
         },
         method="POST"
     )

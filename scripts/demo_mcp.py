@@ -12,7 +12,7 @@ import urllib.request
 import urllib.error
 
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://localhost:4000")
-MASTER_KEY = os.environ.get("LITELLM_MASTER_KEY", "sk-enterprise-master-secret-key-2026")
+API_KEY = os.environ.get("LITELLM_API_KEY") or os.environ.get("LITELLM_MASTER_KEY", "sk-enterprise-master-secret-key-2026")
 
 
 def rpc_call(endpoint: str, method: str, params: dict = None) -> dict:
@@ -30,7 +30,7 @@ def rpc_call(endpoint: str, method: str, params: dict = None) -> dict:
         headers={
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
-            "Authorization": f"Bearer {MASTER_KEY}"
+            "Authorization": f"Bearer {API_KEY}"
         },
         method="POST"
     )

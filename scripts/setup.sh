@@ -136,6 +136,21 @@ provision_keys() {
         "duration": "1d",
         "metadata": {"role": "test_capped"}
       }' >/dev/null && echo "    ✅ Budget-capped key provisioned." || echo "    ⚠️ Note: Check if key already exists."
+
+    # Claude Desktop Dedicated Key: Scoped specifically to github_mcp and resend_mcp
+    echo "    Creating Claude Desktop Key ('sk-agent-claude-desktop')..."
+    curl -s -X POST "$GATEWAY_URL/key/generate" \
+      -H "Authorization: Bearer $MASTER_KEY" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "key": "sk-agent-claude-desktop",
+        "key_alias": "claude-desktop",
+        "user_id": "claude-desktop",
+        "object_permission": {
+          "mcp_servers": ["github_mcp", "resend_mcp"]
+        },
+        "metadata": {"client": "claude-desktop", "role": "agent"}
+      }' >/dev/null && echo "    ✅ Claude Desktop key provisioned." || echo "    ⚠️ Note: Check if key already exists."
 }
 
 # 5. Display Summary and Endpoints

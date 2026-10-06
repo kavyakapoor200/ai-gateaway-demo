@@ -1296,10 +1296,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             const jaegerLink = `http://${window.location.hostname}:16686/trace/${r.trace_id}`;
             const reqDisplay = highlightText(r.request_id, currentSearchQuery);
             let policyTag = '';
-            if (r.policy_action === 'strict_reject') {
-              policyTag = `<div style="margin-top:3px;"><span style="font-size:0.68rem; background:rgba(239,68,68,0.18); color:#fca5a5; border:1px solid rgba(239,68,68,0.35); padding:1px 6px; border-radius:4px; font-weight:600;">⊘ blocked: ${r.violating_tools || '[]'}</span></div>`;
-            } else if (r.policy_action === 'filter') {
-              policyTag = `<div style="margin-top:3px;"><span style="font-size:0.68rem; background:rgba(139,92,246,0.18); color:#c084fc; border:1px solid rgba(139,92,246,0.35); padding:1px 6px; border-radius:4px; font-weight:600;">🛡️ filtered: ${r.violating_tools || '[]'}</span></div>`;
+            if (r.policy_action) {
+              let tList = [];
+              try {
+                tList = JSON.parse(r.violating_tools || '[]');
+              } catch(e) {
+                tList = (r.violating_tools || '').replace(/[\[\]"]/g, '').split(',').map(s => s.trim()).filter(Boolean);
+              }
+              const count = tList.length;
+              const preview = count <= 2 ? tList.join(', ') : `${tList.slice(0, 2).join(', ')} +${count - 2} more`;
+              const fullList = tList.join('\\n');
+
+              if (r.policy_action === 'strict_reject') {
+                policyTag = `<div style="margin-top:4px;"><span style="display:inline-block; max-width:220px; font-size:0.7rem; background:rgba(239,68,68,0.18); color:#fca5a5; border:1px solid rgba(239,68,68,0.35); padding:2px 8px; border-radius:6px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="${fullList}">⊘ Blocked: ${preview}</span></div>`;
+              } else if (r.policy_action === 'filter') {
+                policyTag = `<div style="margin-top:4px;"><span style="display:inline-block; max-width:220px; font-size:0.7rem; background:rgba(139,92,246,0.18); color:#c084fc; border:1px solid rgba(139,92,246,0.35); padding:2px 8px; border-radius:6px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="${fullList}">🛡️ Filtered: ${preview}</span></div>`;
+              }
             }
             return `<tr>
               <td style="color:var(--text-dim); font-size:0.75rem;">${r.created_at || '-'}</td>

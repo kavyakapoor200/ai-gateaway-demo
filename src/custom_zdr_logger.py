@@ -492,18 +492,32 @@ class ZDRAuditLogger(CustomLogger):
                 status = 403
                 task_outcome = "tool_policy_rejected"
                 policy_action = "strict_reject"
-                # Extract violating tools & role from response_obj detail if present
+                # Extract violating tools & role from response_obj or exception detail
                 v_list = None
-                if hasattr(response_obj, "detail") and isinstance(response_obj.detail, dict):
-                    err_info = response_obj.detail.get("error", {})
-                    v_list = err_info.get("violating_tools")
-                    if err_info.get("role"):
-                        caller_role = err_info["role"]
-                elif isinstance(response_obj, dict):
-                    err_info = response_obj.get("error", {})
-                    v_list = err_info.get("violating_tools")
-                    if err_info.get("role"):
-                        caller_role = err_info["role"]
+                exc = kwargs.get("exception") or error
+                for candidate in (response_obj, exc):
+                    if hasattr(candidate, "detail") and isinstance(candidate.detail, dict):
+                        err_info = candidate.detail.get("error", {})
+                        v_list = err_info.get("violating_tools")
+                        if err_info.get("role"):
+                            caller_role = err_info["role"]
+                        break
+                    elif isinstance(candidate, dict):
+                        err_info = candidate.get("error", {})
+                        v_list = err_info.get("violating_tools")
+                        if err_info.get("role"):
+                            caller_role = err_info["role"]
+                        break
+
+                if not v_list:
+                    import re, ast
+                    match = re.search(r"permitted\s+(?:for\s+this\s+API\s+key|for\s+role\s+[^:]+):\s*(\[[^\]]+\])", err_str)
+                    if match:
+                        try:
+                            v_list = ast.literal_eval(match.group(1))
+                        except Exception:
+                            pass
+
                 if v_list:
                     violating_tools = json.dumps(sorted(v_list)) if isinstance(v_list, (list, set, tuple)) else str(v_list)
             elif status is None:

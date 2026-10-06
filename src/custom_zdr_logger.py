@@ -88,7 +88,7 @@ class ZDRAuditLogger(CustomLogger):
         self._ensure_schema()
 
     def _ensure_schema(self):
-        """Ensures gateway_audit_ledger and analytical views exist."""
+        """Ensures gateway_audit_ledger and analytical views exist, with self-healing migrations."""
         try:
             conn = self._get_connection()
             cur = conn.cursor()
@@ -125,11 +125,14 @@ class ZDRAuditLogger(CustomLogger):
                         completion_sha256 TEXT NOT NULL,
                         zdr_verified INTEGER DEFAULT 1,
                         task_id TEXT,
-                        task_outcome TEXT DEFAULT 'pending'
+                        task_outcome TEXT DEFAULT 'pending',
+                        policy_action TEXT DEFAULT NULL,
+                        violating_tools TEXT DEFAULT NULL
                     );
                     CREATE INDEX IF NOT EXISTS idx_trace_id ON gateway_audit_ledger(trace_id);
                     CREATE INDEX IF NOT EXISTS idx_task_id ON gateway_audit_ledger(task_id);
                     CREATE INDEX IF NOT EXISTS idx_created_at ON gateway_audit_ledger(created_at);
+                    CREATE INDEX IF NOT EXISTS idx_policy_action ON gateway_audit_ledger(policy_action);
                     CREATE VIEW IF NOT EXISTS v_coding_cps_summary AS
                     SELECT 
                         task_id,
@@ -159,6 +162,16 @@ class ZDRAuditLogger(CustomLogger):
                         END AS compliance_status
                     FROM gateway_audit_ledger;
                     """)
+            else:
+                # Self-healing migration for existing databases
+                cur.execute("PRAGMA table_info(gateway_audit_ledger);")
+                existing_cols = {row[1] for row in cur.fetchall()}
+                if "policy_action" not in existing_cols:
+                    cur.execute("ALTER TABLE gateway_audit_ledger ADD COLUMN policy_action TEXT DEFAULT NULL;")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_policy_action ON gateway_audit_ledger(policy_action);")
+                if "violating_tools" not in existing_cols:
+                    cur.execute("ALTER TABLE gateway_audit_ledger ADD COLUMN violating_tools TEXT DEFAULT NULL;")
+                conn.commit()
             conn.close()
         except Exception as e:
             print(f"[!] ZDRAuditLogger: Schema bootstrap notice: {e}", file=sys.stderr)
@@ -403,6 +416,9 @@ class ZDRAuditLogger(CustomLogger):
             task_id = meta.get("_zdr_task_id") or self._derive_task_id(key_alias, messages)
             self._sniff_and_index_branch(messages, tool_calls, task_id)
 
+            policy_action = meta.get("_zdr_policy_action")
+            violating_tools = meta.get("_zdr_violating_tools")
+
             # 6. Insert metadata into SQLite gateway_audit_ledger
             conn = self._get_connection()
             cur = conn.cursor()
@@ -412,14 +428,14 @@ class ZDRAuditLogger(CustomLogger):
                     model_requested, model_routed, fallback_triggered,
                     http_status, latency_ms, prompt_tokens, completion_tokens,
                     cost_usd, prompt_sha256, completion_sha256, zdr_verified,
-                    task_id, task_outcome
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'pending')
+                    task_id, task_outcome, policy_action, violating_tools
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'pending', ?, ?)
             """, (
                 req_id, trace_id, key_alias, caller_role,
                 model_req, model_routed, fallback_triggered,
                 200, latency_ms, prompt_tokens, completion_tokens,
                 cost_usd, prompt_sha256, completion_sha256,
-                task_id
+                task_id, policy_action, violating_tools
             ))
             conn.commit()
             conn.close()
@@ -469,9 +485,27 @@ class ZDRAuditLogger(CustomLogger):
 
             task_outcome = "failed"
             err_str = f"{error or ''} {response_obj or ''} {kwargs.get('exception', '')}"
+            policy_action = meta.get("_zdr_policy_action")
+            violating_tools = meta.get("_zdr_violating_tools")
+
             if "tool_not_allowed" in err_str or "Tool execution policy violation" in err_str:
                 status = 403
                 task_outcome = "tool_policy_rejected"
+                policy_action = "strict_reject"
+                # Extract violating tools & role from response_obj detail if present
+                v_list = None
+                if hasattr(response_obj, "detail") and isinstance(response_obj.detail, dict):
+                    err_info = response_obj.detail.get("error", {})
+                    v_list = err_info.get("violating_tools")
+                    if err_info.get("role"):
+                        caller_role = err_info["role"]
+                elif isinstance(response_obj, dict):
+                    err_info = response_obj.get("error", {})
+                    v_list = err_info.get("violating_tools")
+                    if err_info.get("role"):
+                        caller_role = err_info["role"]
+                if v_list:
+                    violating_tools = json.dumps(sorted(v_list)) if isinstance(v_list, (list, set, tuple)) else str(v_list)
             elif status is None:
                 status = 500
 
@@ -491,12 +525,13 @@ class ZDRAuditLogger(CustomLogger):
                     model_requested, model_routed, fallback_triggered,
                     http_status, latency_ms, prompt_tokens, completion_tokens,
                     cost_usd, prompt_sha256, completion_sha256, zdr_verified,
-                    task_id, task_outcome
-                ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, 0, 0, 0.0, ?, ?, 1, ?, ?)
+                    task_id, task_outcome, policy_action, violating_tools
+                ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, 0, 0, 0.0, ?, ?, 1, ?, ?, ?, ?)
             """, (
                 req_id, trace_id, key_alias, caller_role,
                 model_req, model_routed, status, latency_ms,
-                prompt_sha256, completion_sha256, task_id, task_outcome
+                prompt_sha256, completion_sha256, task_id, task_outcome,
+                policy_action, violating_tools
             ))
             conn.commit()
             conn.close()
@@ -711,6 +746,8 @@ class ZDRAuditLogger(CustomLogger):
                             meta = {}
 
                         tool_policy = meta.get("tool_policy", "filter")
+                        caller_role = meta.get("role") or self._read_prop(user_api_key_dict, "role") or "developer"
+                        data.setdefault("metadata", {})["role"] = caller_role
 
                         if tool_policy in ("strict_reject", "strict_whitelist"):
                             msg = (
@@ -730,6 +767,8 @@ class ZDRAuditLogger(CustomLogger):
                                         "violating_tools": sorted(violating_tools),
                                         "allowed_tools": sorted(whitelisted_tools),
                                         "key_alias": key_alias,
+                                        "role": caller_role,
+                                        "policy_action": "strict_reject",
                                     }
                                 },
                             )
@@ -737,6 +776,8 @@ class ZDRAuditLogger(CustomLogger):
                             # Tool Pruning / Virtual Tool Shielding mode (Default for coding agent compatibility)
                             # Strip unallowed tools so LLM never sees them, preventing illegal execution
                             # while keeping the agent session healthy and functional (HTTP 200 OK).
+                            data.setdefault("metadata", {})["_zdr_policy_action"] = "filter"
+                            data["metadata"]["_zdr_violating_tools"] = json.dumps(sorted(violating_tools))
                             violating_set = set(violating_tools)
 
                             # 1. Prune standard 'tools' parameter

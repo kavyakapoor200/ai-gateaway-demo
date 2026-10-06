@@ -42,13 +42,18 @@ CREATE TABLE IF NOT EXISTS gateway_audit_ledger (
     
     -- Coding Task Cost Per Success (CPS) Reconciliation
     task_id TEXT,                    -- e.g. 'task_8a1f10b2c3d4'
-    task_outcome TEXT DEFAULT 'pending' -- 'pending', 'verified_success', 'unmerged_closed'
+    task_outcome TEXT DEFAULT 'pending', -- 'pending', 'verified_success', 'unmerged_closed'
+
+    -- Tool Governance & Policy Intercepts (CISO Observability)
+    policy_action TEXT DEFAULT NULL,   -- 'strict_reject', 'filter'
+    violating_tools TEXT DEFAULT NULL  -- JSON array of tool names, e.g. '["execute_command", "drop_table"]'
 );
 
 -- Fast lookup indexes
 CREATE INDEX IF NOT EXISTS idx_trace_id ON gateway_audit_ledger(trace_id);
 CREATE INDEX IF NOT EXISTS idx_task_id ON gateway_audit_ledger(task_id);
 CREATE INDEX IF NOT EXISTS idx_created_at ON gateway_audit_ledger(created_at);
+CREATE INDEX IF NOT EXISTS idx_policy_action ON gateway_audit_ledger(policy_action);
 
 -- -----------------------------------------------------------------------------
 -- Analytical View: Real-Time Coding CPS Summary

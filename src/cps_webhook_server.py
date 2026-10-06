@@ -13,6 +13,7 @@ import json
 import hashlib
 import sqlite3
 import socket
+import collections
 from urllib.parse import urlparse, parse_qs
 from typing import Optional, Dict, Any, List
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -212,26 +213,30 @@ def get_recent_audit_records(limit: int = 50, query: Optional[str] = None) -> Li
         conn = sqlite3.connect(db_path, timeout=5.0)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
+        cur.execute("PRAGMA table_info(gateway_audit_ledger);")
+        cols = {row["name"] for row in cur.fetchall()}
+        sec_cols = ", policy_action, violating_tools" if "policy_action" in cols else ""
+
         if query and query.strip():
             q = query.strip()
-            cur.execute("""
+            cur.execute(f"""
                 SELECT request_id, trace_id, created_at, api_key_alias, caller_role,
                        model_requested, model_routed, http_status, latency_ms,
                        prompt_tokens, completion_tokens, cost_usd,
                        prompt_sha256, completion_sha256, zdr_verified,
-                       task_id, task_outcome
+                       task_id, task_outcome{sec_cols}
                 FROM gateway_audit_ledger
                 WHERE request_id LIKE ? OR task_id LIKE ? OR trace_id LIKE ? OR api_key_alias LIKE ?
                 ORDER BY created_at DESC
                 LIMIT ?
             """, (f"%{q}%", f"%{q}%", f"%{q}%", f"%{q}%", limit))
         else:
-            cur.execute("""
+            cur.execute(f"""
                 SELECT request_id, trace_id, created_at, api_key_alias, caller_role,
                        model_requested, model_routed, http_status, latency_ms,
                        prompt_tokens, completion_tokens, cost_usd,
                        prompt_sha256, completion_sha256, zdr_verified,
-                       task_id, task_outcome
+                       task_id, task_outcome{sec_cols}
                 FROM gateway_audit_ledger
                 ORDER BY created_at DESC
                 LIMIT ?
@@ -241,6 +246,177 @@ def get_recent_audit_records(limit: int = 50, query: Optional[str] = None) -> Li
     except Exception as e:
         print(f"[!] get_recent_audit_records error: {e}", file=sys.stderr)
     return rows
+
+KNOWN_RISKY_TOOLS = {
+    "execute_command", "drop_table", "bash", "terminal", "query_db",
+    "create_user_profile", "read_file", "git_status", "git_diff",
+    "write_file", "delete_file"
+}
+
+def get_security_stats(db_path: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Computes security and tool governance statistics from gateway_audit_ledger:
+    - Blocked (strict_reject) and Filtered (filter) totals.
+    - Top blocked tools.
+    - Breakdown by key, role, and tool.
+    - Estimated spend avoided for strict_reject (blocked requests x model avg request cost).
+    """
+    if db_path is None:
+        db_path = get_db_path()
+    stats = {
+        "strict_rejections_count": 0,
+        "virtual_shielding_count": 0,
+        "total_blocked": 0,
+        "total_filtered": 0,
+        "spend_avoided_estimated_usd": 0.0,
+        "spend_avoided_display": "n/a (Estimated)",
+        "has_spend_avoided": False,
+        "top_blocked_tools": [],
+        "by_key": [],
+        "by_role": [],
+        "by_tool": [],
+        "by_key_role": [],
+        "policy_actions_counter": {}  # {(key, role, tool, action): count}
+    }
+    try:
+        conn = sqlite3.connect(db_path, timeout=5.0)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        cur.execute("PRAGMA table_info(gateway_audit_ledger);")
+        cols = {row["name"] for row in cur.fetchall()}
+        if "policy_action" not in cols:
+            conn.close()
+            return stats
+
+        # 1. Total counts
+        cur.execute("SELECT COUNT(*) FROM gateway_audit_ledger WHERE policy_action = 'strict_reject'")
+        stats["total_blocked"] = cur.fetchone()[0] or 0
+        stats["strict_rejections_count"] = stats["total_blocked"]
+
+        cur.execute("SELECT COUNT(*) FROM gateway_audit_ledger WHERE policy_action = 'filter'")
+        stats["total_filtered"] = cur.fetchone()[0] or 0
+        stats["virtual_shielding_count"] = stats["total_filtered"]
+
+        # 2. Estimated Spend Avoided (Strict Reject only, per request, model-isolated)
+        cur.execute("""
+            SELECT model_requested, COUNT(*) as blocked_count
+            FROM gateway_audit_ledger
+            WHERE policy_action = 'strict_reject'
+            GROUP BY model_requested
+        """)
+        blocked_by_model = cur.fetchall()
+
+        total_spend_avoided = 0.0
+        has_any_cost_history = False
+
+        for b_row in blocked_by_model:
+            m_name = b_row["model_requested"]
+            b_cnt = b_row["blocked_count"]
+            cur.execute("""
+                SELECT AVG(cost_usd) as avg_cost, COUNT(*) as cost_cnt
+                FROM gateway_audit_ledger
+                WHERE model_requested = ? AND cost_usd > 0
+            """, (m_name,))
+            c_row = cur.fetchone()
+            if c_row and c_row["cost_cnt"] and c_row["cost_cnt"] > 0 and c_row["avg_cost"] is not None:
+                has_any_cost_history = True
+                total_spend_avoided += b_cnt * float(c_row["avg_cost"])
+
+        if has_any_cost_history and stats["total_blocked"] > 0:
+            stats["spend_avoided_estimated_usd"] = round(total_spend_avoided, 6)
+            stats["spend_avoided_display"] = f"${total_spend_avoided:.4f} (Estimated)"
+            stats["has_spend_avoided"] = True
+        else:
+            stats["spend_avoided_estimated_usd"] = 0.0
+            stats["spend_avoided_display"] = "n/a (Estimated)"
+            stats["has_spend_avoided"] = False
+
+        # 3. Process violating tools and breakdowns
+        k_col = "api_key_alias" if "api_key_alias" in cols else "key_alias"
+        cur.execute(f"""
+            SELECT {k_col} as key_alias, caller_role, policy_action, violating_tools
+            FROM gateway_audit_ledger
+            WHERE policy_action IS NOT NULL
+        """)
+        rows = cur.fetchall()
+
+        tool_intercept_counts = collections.defaultdict(int)
+        tool_blocked_counts = collections.defaultdict(int)
+        tool_filtered_counts = collections.defaultdict(int)
+        key_breakdown = collections.defaultdict(lambda: {"blocked": 0, "filtered": 0, "role": "developer"})
+        role_breakdown = collections.defaultdict(lambda: {"blocked": 0, "filtered": 0})
+        policy_counter = collections.defaultdict(int)
+
+        for r in rows:
+            k = r["key_alias"] or "unknown"
+            role = r["caller_role"] or "developer"
+            action = r["policy_action"]  # 'strict_reject' or 'filter'
+
+            if action == "strict_reject":
+                key_breakdown[k]["blocked"] += 1
+                role_breakdown[role]["blocked"] += 1
+            elif action == "filter":
+                key_breakdown[k]["filtered"] += 1
+                role_breakdown[role]["filtered"] += 1
+            key_breakdown[k]["role"] = role
+
+            v_raw = r["violating_tools"]
+            tools = []
+            if v_raw:
+                try:
+                    tools = json.loads(v_raw) if isinstance(v_raw, str) else v_raw
+                    if not isinstance(tools, list):
+                        tools = [str(tools)]
+                except Exception:
+                    tools = [t.strip() for t in v_raw.split(",") if t.strip()]
+
+            for t in tools:
+                tool_intercept_counts[t] += 1
+                if action == "strict_reject":
+                    tool_blocked_counts[t] += 1
+                elif action == "filter":
+                    tool_filtered_counts[t] += 1
+
+                # Prometheus bucketing: allowlist or 'other'
+                p_tool = t if t in KNOWN_RISKY_TOOLS else "other"
+                policy_counter[(k, role, p_tool, action)] += 1
+
+        # Top blocked tools (sorted by total intercepts desc)
+        sorted_tools = sorted(tool_intercept_counts.items(), key=lambda x: x[1], reverse=True)
+        stats["top_blocked_tools"] = [{"tool": t, "count": c} for t, c in sorted_tools]
+
+        # By Key list
+        stats["by_key"] = [
+            {"key": k, "role": v["role"], "blocked": v["blocked"], "filtered": v["filtered"]}
+            for k, v in key_breakdown.items()
+        ]
+
+        # By Key & Role list for dashboard
+        stats["by_key_role"] = [
+            {"key_alias": k, "role": v["role"], "blocked": v["blocked"], "filtered": v["filtered"]}
+            for k, v in key_breakdown.items()
+        ]
+
+        # By Role list
+        stats["by_role"] = [
+            {"role": role, "blocked": v["blocked"], "filtered": v["filtered"]}
+            for role, v in role_breakdown.items()
+        ]
+
+        # By Tool summary
+        all_tool_names = set(tool_blocked_counts.keys()) | set(tool_filtered_counts.keys())
+        stats["by_tool"] = [
+            {"tool": t, "blocked": tool_blocked_counts[t], "filtered": tool_filtered_counts[t]}
+            for t in sorted(all_tool_names)
+        ]
+
+        stats["policy_actions_counter"] = policy_counter
+        conn.close()
+    except Exception as e:
+        print(f"[!] get_security_stats error: {e}", file=sys.stderr)
+
+    return stats
 
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -751,6 +927,77 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
     </div>
 
+    <!-- Executive Section: CISO Security & Tool Policy Intercepts -->
+    <div class="section-box" style="border: 1px solid rgba(239, 68, 68, 0.25); background: rgba(18, 24, 38, 0.85);">
+      <div class="section-header" style="border-bottom: 1px solid rgba(239, 68, 68, 0.15);">
+        <div class="section-title">
+          <span style="display: flex; align-items: center; gap: 8px;">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#f87171" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+            What Did The Gateway Stop? (CISO Security Governance)
+          </span>
+          <span class="badge-count" id="badge-sec-blocked" style="background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.4);">0 Blocked</span>
+          <span class="badge-count" id="badge-sec-filtered" style="background: rgba(139, 92, 246, 0.2); color: #c084fc; border: 1px solid rgba(139, 92, 246, 0.4);">0 Filtered</span>
+        </div>
+        <div style="font-size: 0.8125rem; color: var(--text-dim);">Real-time ingress audit of disallowed tool executions, virtual shielding &amp; estimated financial loss avoided</div>
+      </div>
+      <div style="padding: 20px 24px;">
+        <!-- Top Metrics Cards -->
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 20px;">
+          <div style="background: rgba(239, 68, 68, 0.08); border: 1px solid rgba(239, 68, 68, 0.2); border-radius: 10px; padding: 14px 18px;">
+            <div style="font-size: 0.8125rem; color: #f87171; font-weight: 600;">Strict Rejections (Blocked)</div>
+            <div id="sec-val-blocked" style="font-size: 1.5rem; font-weight: 700; color: #ffffff; margin-top: 6px;">0</div>
+            <div style="font-size: 0.75rem; color: var(--text-dim);">HTTP 403 Stop &bull; 0 Upstream Tokens</div>
+          </div>
+          <div style="background: rgba(139, 92, 246, 0.08); border: 1px solid rgba(139, 92, 246, 0.2); border-radius: 10px; padding: 14px 18px;">
+            <div style="font-size: 0.8125rem; color: #c084fc; font-weight: 600;">Virtual Shielding (Filtered)</div>
+            <div id="sec-val-filtered" style="font-size: 1.5rem; font-weight: 700; color: #ffffff; margin-top: 6px;">0</div>
+            <div style="font-size: 0.75rem; color: var(--text-dim);">HTTP 200 OK &bull; Disallowed Tools Pruned</div>
+          </div>
+          <div style="background: rgba(16, 185, 129, 0.08); border: 1px solid rgba(16, 185, 129, 0.2); border-radius: 10px; padding: 14px 18px;">
+            <div style="font-size: 0.8125rem; color: #34d399; font-weight: 600;">Estimated Spend Avoided</div>
+            <div id="sec-val-spend-avoided" style="font-size: 1.5rem; font-weight: 700; color: #34d399; margin-top: 6px;">n/a (Estimated)</div>
+            <div style="font-size: 0.75rem; color: var(--text-dim);">Blocked Calls &times; Model Historical Avg Cost</div>
+          </div>
+        </div>
+
+        <!-- 2 Column Breakdown: Top Blocked Tools + Breakdown by Key/Role -->
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 20px;">
+          <!-- Left: Top Blocked Tools -->
+          <div style="background: rgba(15, 23, 42, 0.5); border: 1px solid var(--border-subtle); border-radius: 10px; padding: 16px;">
+            <div style="font-size: 0.875rem; font-weight: 600; color: var(--text-main); margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between;">
+              <span>Top Blocked Tools</span>
+              <span style="font-size: 0.75rem; color: var(--text-dim);">Strict &amp; Filtered</span>
+            </div>
+            <div id="sec-tools-list" style="display: flex; flex-direction: column; gap: 8px;">
+              <div style="color: var(--text-dim); font-size: 0.8125rem;">No tool policy intercepts recorded yet.</div>
+            </div>
+          </div>
+
+          <!-- Right: Breakdown by API Key & Role -->
+          <div style="background: rgba(15, 23, 42, 0.5); border: 1px solid var(--border-subtle); border-radius: 10px; padding: 16px;">
+            <div style="font-size: 0.875rem; font-weight: 600; color: var(--text-main); margin-bottom: 12px;">
+              Policy Actions by Key &amp; Role
+            </div>
+            <div class="table-container">
+              <table style="font-size: 0.8125rem;">
+                <thead>
+                  <tr>
+                    <th style="padding: 8px 12px;">API Key Alias</th>
+                    <th style="padding: 8px 12px;">Role</th>
+                    <th style="padding: 8px 12px;">Blocked</th>
+                    <th style="padding: 8px 12px;">Filtered</th>
+                  </tr>
+                </thead>
+                <tbody id="tbody-sec-keys">
+                  <tr><td colspan="4" style="text-align:center; color: var(--text-dim); padding: 12px;">No key violations logged.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Section 1: Coding Tasks CPS Analytical Table -->
     <div class="section-box">
       <div class="section-header">
@@ -846,11 +1093,53 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           ? `/api/audit?q=${encodeURIComponent(currentSearchQuery)}`
           : '/api/audit';
 
-        const [statsRes, cpsRes, auditRes] = await Promise.all([
+        const [statsRes, cpsRes, auditRes, secRes] = await Promise.all([
           fetch('/api/stats').then(r => r.json()),
           fetch('/api/cps').then(r => r.json()),
-          fetch(auditUrl).then(r => r.json())
+          fetch(auditUrl).then(r => r.json()),
+          fetch('/api/security').then(r => r.json()).catch(() => ({}))
         ]);
+
+        // Security Governance Panel
+        if (secRes) {
+          const blocked = secRes.strict_rejections_count || 0;
+          const filtered = secRes.virtual_shielding_count || 0;
+          document.getElementById('badge-sec-blocked').textContent = `${blocked} Blocked`;
+          document.getElementById('badge-sec-filtered').textContent = `${filtered} Filtered`;
+          document.getElementById('sec-val-blocked').textContent = blocked;
+          document.getElementById('sec-val-filtered').textContent = filtered;
+          document.getElementById('sec-val-spend-avoided').textContent = secRes.spend_avoided_display || 'n/a (Estimated)';
+
+          // Top Blocked Tools list
+          const toolsEl = document.getElementById('sec-tools-list');
+          const tools = secRes.top_blocked_tools || [];
+          if (tools.length === 0) {
+            toolsEl.innerHTML = '<div style="color: var(--text-dim); font-size: 0.8125rem;">No tool policy intercepts recorded yet.</div>';
+          } else {
+            toolsEl.innerHTML = tools.map(item => `
+              <div style="display: flex; justify-content: space-between; align-items: center; padding: 6px 10px; background: rgba(30, 41, 59, 0.4); border-radius: 6px; border: 1px solid rgba(255,255,255,0.04);">
+                <span class="mono" style="color: #f87171; font-weight: 500;">${item.tool}</span>
+                <span style="font-size: 0.75rem; background: rgba(239, 68, 68, 0.15); color: #fca5a5; padding: 2px 8px; border-radius: 12px; font-weight: 600;">${item.count} stops</span>
+              </div>
+            `).join('');
+          }
+
+          // Key & Role Breakdown Table
+          const tbodySec = document.getElementById('tbody-sec-keys');
+          const keyRows = secRes.by_key_role || [];
+          if (keyRows.length === 0) {
+            tbodySec.innerHTML = '<tr><td colspan="4" style="text-align:center; color: var(--text-dim); padding: 12px;">No key violations logged.</td></tr>';
+          } else {
+            tbodySec.innerHTML = keyRows.map(row => `
+              <tr>
+                <td class="mono" style="color: var(--primary-light); padding: 8px 12px;">${row.key_alias || 'unknown'}</td>
+                <td style="padding: 8px 12px;"><span class="role-badge" style="background: rgba(99, 102, 241, 0.15); color: #a5b4fc; padding: 2px 6px; border-radius: 4px; font-size: 0.75rem;">${row.role || 'developer'}</span></td>
+                <td class="mono" style="color: #f87171; font-weight: 600; padding: 8px 12px;">${row.blocked || 0}</td>
+                <td class="mono" style="color: #c084fc; font-weight: 600; padding: 8px 12px;">${row.filtered || 0}</td>
+              </tr>
+            `).join('');
+          }
+        }
 
         // 1. Update KPIs
         document.getElementById('kpi-total-tasks').textContent = statsRes.total_tasks || 0;
@@ -1075,8 +1364,19 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif self.path == "/api/security":
+            data = get_security_stats()
+            data.pop("policy_actions_counter", None)
+            body = json.dumps(data).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         elif self.path in ("/metrics", "/metrics/"):
             stats = get_db_stats()
+            sec_stats = get_security_stats()
             s_by_o = stats.get("spend_by_outcome", {})
             prom_lines = [
                 "# HELP ai_gateway_tasks_total Total coding tasks recorded by gateway",
@@ -1106,8 +1406,15 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 f'ai_gateway_spend_by_outcome_usd{{outcome="other"}} {s_by_o.get("other", 0.0)}',
                 "# HELP ai_gateway_zdr_compliant Zero Data Retention Invariant Compliance (1 = 100% compliant)",
                 "# TYPE ai_gateway_zdr_compliant gauge",
-                f"ai_gateway_zdr_compliant {1 if '100%' in stats.get('zdr_status', '') else 0}"
+                f"ai_gateway_zdr_compliant {1 if '100%' in stats.get('zdr_status', '') else 0}",
+                "# HELP ai_gateway_spend_avoided_estimated_usd Estimated dollar spend avoided via strict policy rejections",
+                "# TYPE ai_gateway_spend_avoided_estimated_usd gauge",
+                f"ai_gateway_spend_avoided_estimated_usd {sec_stats.get('spend_avoided_estimated_usd', 0.0)}",
+                "# HELP ai_gateway_tool_policy_actions_total Total tool policy actions (strict_reject or filter) by key, role, tool, and action",
+                "# TYPE ai_gateway_tool_policy_actions_total counter"
             ]
+            for (p_key, p_role, p_tool, p_action), p_count in sorted(sec_stats.get("policy_actions_counter", {}).items()):
+                prom_lines.append(f'ai_gateway_tool_policy_actions_total{{key="{p_key}",role="{p_role}",tool="{p_tool}",action="{p_action}"}} {p_count}')
             prom_body = ("\n".join(prom_lines) + "\n").encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")

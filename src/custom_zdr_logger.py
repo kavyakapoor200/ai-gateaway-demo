@@ -56,6 +56,9 @@ class ZDRAuditLogger(CustomLogger):
     Calculates SHA-256 digests in memory and records zero plaintext.
     """
 
+    _POLICY_INTERCEPT_CACHE: Dict[str, Dict[str, Any]] = {}
+    _RECENT_KEY_INTERCEPT: Dict[str, Dict[str, Any]] = {}
+
     def __init__(self, db_path: Optional[str] = None, redis_host: Optional[str] = None, redis_port: Optional[int] = None):
         super().__init__()
         # Determine database path
@@ -418,6 +421,22 @@ class ZDRAuditLogger(CustomLogger):
 
             policy_action = meta.get("_zdr_policy_action")
             violating_tools = meta.get("_zdr_violating_tools")
+
+            # Fallback for Anthropic /v1/messages endpoints where LiteLLM does not propagate data["metadata"]
+            if not policy_action:
+                cached_entry = ZDRAuditLogger._POLICY_INTERCEPT_CACHE.pop(prompt_sha256, None)
+                if not cached_entry and key_alias in ZDRAuditLogger._RECENT_KEY_INTERCEPT:
+                    recent = ZDRAuditLogger._RECENT_KEY_INTERCEPT[key_alias]
+                    if time.time() - recent.get("time", 0) < 120:
+                        cached_entry = recent
+                if cached_entry:
+                    policy_action = cached_entry.get("policy_action")
+                    violating_tools = cached_entry.get("violating_tools")
+                    if caller_role == "developer" and cached_entry.get("role"):
+                        caller_role = cached_entry.get("role")
+
+            if caller_role == "developer" and "intern" in key_alias.lower():
+                caller_role = "intern"
 
             # 6. Insert metadata into SQLite gateway_audit_ledger
             conn = self._get_connection()
@@ -792,6 +811,20 @@ class ZDRAuditLogger(CustomLogger):
                             # while keeping the agent session healthy and functional (HTTP 200 OK).
                             data.setdefault("metadata", {})["_zdr_policy_action"] = "filter"
                             data["metadata"]["_zdr_violating_tools"] = json.dumps(sorted(violating_tools))
+                            data.setdefault("litellm_metadata", {})["_zdr_policy_action"] = "filter"
+                            data["litellm_metadata"]["_zdr_violating_tools"] = json.dumps(sorted(violating_tools))
+
+                            # Ephemeral cache bridge for Anthropic /v1/messages logging
+                            p_sha = self._hash_payload(data.get("messages"))
+                            cache_entry = {
+                                "policy_action": "filter",
+                                "violating_tools": json.dumps(sorted(violating_tools)),
+                                "role": caller_role,
+                                "key_alias": key_alias,
+                                "time": time.time(),
+                            }
+                            ZDRAuditLogger._POLICY_INTERCEPT_CACHE[p_sha] = cache_entry
+                            ZDRAuditLogger._RECENT_KEY_INTERCEPT[key_alias] = cache_entry
                             violating_set = set(violating_tools)
 
                             # 1. Prune standard 'tools' parameter

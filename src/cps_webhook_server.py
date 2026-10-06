@@ -384,7 +384,18 @@ def get_security_stats(db_path: Optional[str] = None) -> Dict[str, Any]:
 
         # Top blocked tools (sorted by total intercepts desc)
         sorted_tools = sorted(tool_intercept_counts.items(), key=lambda x: x[1], reverse=True)
-        stats["top_blocked_tools"] = [{"tool": t, "count": c} for t, c in sorted_tools]
+        stats["top_blocked_tools"] = [
+            {"tool": t, "count": c, "blocked": tool_blocked_counts[t], "filtered": tool_filtered_counts[t]}
+            for t, c in sorted_tools
+        ]
+        stats["blocked_tools"] = [
+            {"tool": t, "count": c}
+            for t, c in sorted(tool_blocked_counts.items(), key=lambda x: x[1], reverse=True)
+        ]
+        stats["filtered_tools"] = [
+            {"tool": t, "count": c}
+            for t, c in sorted(tool_filtered_counts.items(), key=lambda x: x[1], reverse=True)
+        ]
 
         # By Key list
         stats["by_key"] = [
@@ -960,16 +971,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           </div>
         </div>
 
-        <!-- 2 Column Breakdown: Top Blocked Tools + Breakdown by Key/Role -->
-        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 20px;">
-          <!-- Left: Top Blocked Tools -->
-          <div style="background: rgba(15, 23, 42, 0.5); border: 1px solid var(--border-subtle); border-radius: 10px; padding: 16px;">
-            <div style="font-size: 0.875rem; font-weight: 600; color: var(--text-main); margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between;">
-              <span>Top Blocked Tools</span>
-              <span style="font-size: 0.75rem; color: var(--text-dim);">Strict &amp; Filtered</span>
+        <!-- 3 Column Breakdown: Strictly Blocked Tools + Filtered Tools + Key/Role -->
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px;">
+          <!-- Left: Strictly Blocked Tools -->
+          <div style="background: rgba(15, 23, 42, 0.5); border: 1px solid rgba(239, 68, 68, 0.25); border-radius: 10px; padding: 16px;">
+            <div style="font-size: 0.875rem; font-weight: 600; color: #f87171; margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between;">
+              <span>🛑 Strictly Blocked Tools</span>
+              <span id="badge-tools-blocked-cnt" style="font-size: 0.72rem; background: rgba(239, 68, 68, 0.2); color: #fca5a5; padding: 2px 7px; border-radius: 8px;">0 tools</span>
             </div>
-            <div id="sec-tools-list" style="display: flex; flex-direction: column; gap: 8px;">
-              <div style="color: var(--text-dim); font-size: 0.8125rem;">No tool policy intercepts recorded yet.</div>
+            <div id="sec-tools-blocked-list" style="display: flex; flex-direction: column; gap: 8px; max-height: 250px; overflow-y: auto;">
+              <div style="color: var(--text-dim); font-size: 0.8125rem;">No strictly blocked tools recorded yet.</div>
+            </div>
+          </div>
+
+          <!-- Middle: Filtered Out Tools (Virtual Shielding) -->
+          <div style="background: rgba(15, 23, 42, 0.5); border: 1px solid rgba(139, 92, 246, 0.25); border-radius: 10px; padding: 16px;">
+            <div style="font-size: 0.875rem; font-weight: 600; color: #c084fc; margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between;">
+              <span>🛡️ Filtered Out Tools</span>
+              <span id="badge-tools-filtered-cnt" style="font-size: 0.72rem; background: rgba(139, 92, 246, 0.2); color: #c084fc; padding: 2px 7px; border-radius: 8px;">0 tools</span>
+            </div>
+            <div id="sec-tools-filtered-list" style="display: flex; flex-direction: column; gap: 8px; max-height: 250px; overflow-y: auto;">
+              <div style="color: var(--text-dim); font-size: 0.8125rem;">No filtered tools recorded yet.</div>
             </div>
           </div>
 
@@ -1110,26 +1132,36 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           document.getElementById('sec-val-filtered').textContent = filtered;
           document.getElementById('sec-val-spend-avoided').textContent = secRes.spend_avoided_display || 'n/a (Estimated)';
 
-          // Top Blocked Tools list
-          const toolsEl = document.getElementById('sec-tools-list');
-          const tools = secRes.top_blocked_tools || [];
-          if (tools.length === 0) {
-            toolsEl.innerHTML = '<div style="color: var(--text-dim); font-size: 0.8125rem;">No tool policy intercepts recorded yet.</div>';
+          // Strictly Blocked Tools list
+          const bToolsEl = document.getElementById('sec-tools-blocked-list');
+          const bTools = secRes.blocked_tools || [];
+          const bBadge = document.getElementById('badge-tools-blocked-cnt');
+          if (bBadge) bBadge.textContent = `${bTools.length} tools`;
+          if (bTools.length === 0) {
+            bToolsEl.innerHTML = '<div style="color: var(--text-dim); font-size: 0.8125rem;">No strictly blocked tools recorded yet.</div>';
           } else {
-            toolsEl.innerHTML = tools.map(item => {
-              let badges = [];
-              if (item.blocked > 0) {
-                badges.push(`<span style="font-size: 0.72rem; background: rgba(239, 68, 68, 0.18); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.35); padding: 2px 7px; border-radius: 8px; font-weight: 600;">${item.blocked} blocked</span>`);
-              }
-              if (item.filtered > 0) {
-                badges.push(`<span style="font-size: 0.72rem; background: rgba(139, 92, 246, 0.18); color: #c084fc; border: 1px solid rgba(139, 92, 246, 0.35); padding: 2px 7px; border-radius: 8px; font-weight: 600;">${item.filtered} filtered</span>`);
-              }
-              return `
-              <div style="display: flex; justify-content: space-between; align-items: center; padding: 6px 10px; background: rgba(30, 41, 59, 0.4); border-radius: 6px; border: 1px solid rgba(255,255,255,0.04);">
-                <span class="mono" style="color: #f1f5f9; font-weight: 500;">${item.tool}</span>
-                <div style="display: flex; gap: 6px;">${badges.join('')}</div>
-              </div>`;
-            }).join('');
+            bToolsEl.innerHTML = bTools.map(item => `
+              <div style="display: flex; justify-content: space-between; align-items: center; padding: 6px 10px; background: rgba(30, 41, 59, 0.4); border-radius: 6px; border: 1px solid rgba(239, 68, 68, 0.2);">
+                <span class="mono" style="color: #f87171; font-weight: 500; font-size: 0.8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 70%;" title="${item.tool}">${item.tool}</span>
+                <span style="font-size: 0.72rem; background: rgba(239, 68, 68, 0.2); color: #fca5a5; padding: 2px 7px; border-radius: 8px; font-weight: 600; white-space: nowrap;">${item.count} blocked</span>
+              </div>
+            `).join('');
+          }
+
+          // Filtered Out Tools list (Virtual Shielding)
+          const fToolsEl = document.getElementById('sec-tools-filtered-list');
+          const fTools = secRes.filtered_tools || [];
+          const fBadge = document.getElementById('badge-tools-filtered-cnt');
+          if (fBadge) fBadge.textContent = `${fTools.length} tools`;
+          if (fTools.length === 0) {
+            fToolsEl.innerHTML = '<div style="color: var(--text-dim); font-size: 0.8125rem;">No filtered tools recorded yet.</div>';
+          } else {
+            fToolsEl.innerHTML = fTools.map(item => `
+              <div style="display: flex; justify-content: space-between; align-items: center; padding: 6px 10px; background: rgba(30, 41, 59, 0.4); border-radius: 6px; border: 1px solid rgba(139, 92, 246, 0.2);">
+                <span class="mono" style="color: #c084fc; font-weight: 500; font-size: 0.8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 70%;" title="${item.tool}">${item.tool}</span>
+                <span style="font-size: 0.72rem; background: rgba(139, 92, 246, 0.2); color: #c084fc; padding: 2px 7px; border-radius: 8px; font-weight: 600; white-space: nowrap;">${item.count} filtered</span>
+              </div>
+            `).join('');
           }
 
           // Key & Role Breakdown Table
@@ -1262,6 +1294,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           tbodyAudit.innerHTML = auditRes.map(r => {
             const promptHashShort = r.prompt_sha256 ? `${r.prompt_sha256.substring(0, 8)}...${r.prompt_sha256.substring(56)}` : '-';
             const jaegerLink = `http://${window.location.hostname}:16686/trace/${r.trace_id}`;
+            const reqDisplay = highlightText(r.request_id, currentSearchQuery);
             let policyTag = '';
             if (r.policy_action === 'strict_reject') {
               policyTag = `<div style="margin-top:3px;"><span style="font-size:0.68rem; background:rgba(239,68,68,0.18); color:#fca5a5; border:1px solid rgba(239,68,68,0.35); padding:1px 6px; border-radius:4px; font-weight:600;">⊘ blocked: ${r.violating_tools || '[]'}</span></div>`;

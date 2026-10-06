@@ -1116,12 +1116,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           if (tools.length === 0) {
             toolsEl.innerHTML = '<div style="color: var(--text-dim); font-size: 0.8125rem;">No tool policy intercepts recorded yet.</div>';
           } else {
-            toolsEl.innerHTML = tools.map(item => `
+            toolsEl.innerHTML = tools.map(item => {
+              let badges = [];
+              if (item.blocked > 0) {
+                badges.push(`<span style="font-size: 0.72rem; background: rgba(239, 68, 68, 0.18); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.35); padding: 2px 7px; border-radius: 8px; font-weight: 600;">${item.blocked} blocked</span>`);
+              }
+              if (item.filtered > 0) {
+                badges.push(`<span style="font-size: 0.72rem; background: rgba(139, 92, 246, 0.18); color: #c084fc; border: 1px solid rgba(139, 92, 246, 0.35); padding: 2px 7px; border-radius: 8px; font-weight: 600;">${item.filtered} filtered</span>`);
+              }
+              return `
               <div style="display: flex; justify-content: space-between; align-items: center; padding: 6px 10px; background: rgba(30, 41, 59, 0.4); border-radius: 6px; border: 1px solid rgba(255,255,255,0.04);">
-                <span class="mono" style="color: #f87171; font-weight: 500;">${item.tool}</span>
-                <span style="font-size: 0.75rem; background: rgba(239, 68, 68, 0.15); color: #fca5a5; padding: 2px 8px; border-radius: 12px; font-weight: 600;">${item.count} stops</span>
-              </div>
-            `).join('');
+                <span class="mono" style="color: #f1f5f9; font-weight: 500;">${item.tool}</span>
+                <div style="display: flex; gap: 6px;">${badges.join('')}</div>
+              </div>`;
+            }).join('');
           }
 
           // Key & Role Breakdown Table
@@ -1254,11 +1262,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           tbodyAudit.innerHTML = auditRes.map(r => {
             const promptHashShort = r.prompt_sha256 ? `${r.prompt_sha256.substring(0, 8)}...${r.prompt_sha256.substring(56)}` : '-';
             const jaegerLink = `http://${window.location.hostname}:16686/trace/${r.trace_id}`;
-            const reqDisplay = highlightText(r.request_id, currentSearchQuery);
+            let policyTag = '';
+            if (r.policy_action === 'strict_reject') {
+              policyTag = `<div style="margin-top:3px;"><span style="font-size:0.68rem; background:rgba(239,68,68,0.18); color:#fca5a5; border:1px solid rgba(239,68,68,0.35); padding:1px 6px; border-radius:4px; font-weight:600;">⊘ blocked: ${r.violating_tools || '[]'}</span></div>`;
+            } else if (r.policy_action === 'filter') {
+              policyTag = `<div style="margin-top:3px;"><span style="font-size:0.68rem; background:rgba(139,92,246,0.18); color:#c084fc; border:1px solid rgba(139,92,246,0.35); padding:1px 6px; border-radius:4px; font-weight:600;">🛡️ filtered: ${r.violating_tools || '[]'}</span></div>`;
+            }
             return `<tr>
               <td style="color:var(--text-dim); font-size:0.75rem;">${r.created_at || '-'}</td>
               <td><span class="mono copyable-req" onclick="copyToClipboard('${r.request_id}', this)" title="Click to copy Request ID">${reqDisplay}</span></td>
-              <td><span class="mono" style="color:var(--text-muted);">${highlightText(r.api_key_alias || 'developer', currentSearchQuery)}</span></td>
+              <td><span class="mono" style="color:var(--text-muted);">${highlightText(r.api_key_alias || 'developer', currentSearchQuery)}</span>${policyTag}</td>
               <td><span style="font-weight:500;">${r.model_routed || r.model_requested}</span></td>
               <td class="mono">${r.latency_ms ? r.latency_ms.toFixed(1) : 0}ms</td>
               <td class="mono">${r.prompt_tokens || 0} / ${r.completion_tokens || 0}</td>

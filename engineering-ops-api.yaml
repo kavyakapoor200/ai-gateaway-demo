@@ -1,0 +1,581 @@
+openapi: 3.0.3
+info:
+  title: Engineering Ops API
+  version: 1.0.0
+  description: |
+    Internal API that coding agents use to work through a bug-fix loop:
+    pick up an issue, read the failing CI logs, open a pull request, and
+    request a deployment.
+
+    Every operation carries an `x-access` extension (`read` or `write`) so a
+    gateway can apply role-based rules without parsing HTTP methods.
+    Production deployments are never completed through this API: a request
+    stays in `pending_approval` until a human approves it elsewhere.
+servers:
+  - url: http://host.docker.internal:8089/api/v1
+    description: Local mock Engineering Ops backend
+security:
+  - ApiKeyAuth: []
+tags:
+  - name: Issues
+    description: Bug reports and tasks
+  - name: CI
+    description: Pipeline runs and their logs
+  - name: Pull Requests
+    description: Code changes proposed by an agent or a person
+  - name: Deployments
+    description: Release requests per environment
+
+paths:
+  /issues:
+    get:
+      tags: [Issues]
+      operationId: listIssues
+      summary: List issues
+      description: Returns issues, newest first. Use filters to narrow down to work an agent can pick up.
+      x-access: read
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [open, in_progress, closed]
+        - name: label
+          in: query
+          description: Only issues carrying this label, for example `bug`.
+          schema:
+            type: string
+        - name: assignee
+          in: query
+          description: Username of the assignee, or `unassigned`.
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of issues
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Issue'
+                  next_cursor:
+                    type: string
+                    nullable: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /issues/{issueId}:
+    get:
+      tags: [Issues]
+      operationId: getIssue
+      summary: Get one issue
+      description: Full issue details, including the description and the latest comments.
+      x-access: read
+      parameters:
+        - $ref: '#/components/parameters/IssueId'
+      responses:
+        '200':
+          description: The issue
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Issue'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /issues/{issueId}/comments:
+    post:
+      tags: [Issues]
+      operationId: addIssueComment
+      summary: Comment on an issue
+      description: Posts a comment as the calling agent, for example a progress note or a summary of a fix.
+      x-access: write
+      parameters:
+        - $ref: '#/components/parameters/IssueId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body]
+              properties:
+                body:
+                  type: string
+                  minLength: 1
+                  maxLength: 5000
+      responses:
+        '201':
+          description: Comment created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Comment'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /ci/runs:
+    get:
+      tags: [CI]
+      operationId: listCiRuns
+      summary: List CI runs
+      description: Returns pipeline runs, newest first. Filter by branch to find the run for a specific change.
+      x-access: read
+      parameters:
+        - name: branch
+          in: query
+          schema:
+            type: string
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [queued, running, passed, failed, cancelled]
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A list of runs
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CiRun'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /ci/runs/{runId}:
+    get:
+      tags: [CI]
+      operationId: getCiRun
+      summary: Get one CI run
+      description: Run details with the status of each job, so you can tell which job failed.
+      x-access: read
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+      responses:
+        '200':
+          description: The run
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CiRun'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /ci/runs/{runId}/logs:
+    get:
+      tags: [CI]
+      operationId: getCiRunLogs
+      summary: Get logs for a CI run
+      description: |
+        Returns the last lines of a job's log. Secrets are masked by the
+        service before they are returned.
+      x-access: read
+      parameters:
+        - $ref: '#/components/parameters/RunId'
+        - name: job
+          in: query
+          required: true
+          description: Name of the job, as listed in the run details.
+          schema:
+            type: string
+        - name: tail_lines
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 2000
+            default: 200
+      responses:
+        '200':
+          description: Log lines
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [job, lines, truncated]
+                properties:
+                  job:
+                    type: string
+                  truncated:
+                    type: boolean
+                    description: True when earlier lines were left out.
+                  lines:
+                    type: array
+                    items:
+                      type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /pull-requests:
+    post:
+      tags: [Pull Requests]
+      operationId: createPullRequest
+      summary: Open a pull request
+      description: |
+        Opens a pull request from a branch the agent has already pushed.
+        Pull requests start as drafts unless `draft` is set to false.
+      x-access: write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title, source_branch]
+              properties:
+                title:
+                  type: string
+                  maxLength: 200
+                description:
+                  type: string
+                source_branch:
+                  type: string
+                target_branch:
+                  type: string
+                  default: main
+                linked_issue_id:
+                  type: string
+                  description: Issue this change resolves.
+                draft:
+                  type: boolean
+                  default: true
+      responses:
+        '201':
+          description: Pull request created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PullRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /pull-requests/{prId}:
+    get:
+      tags: [Pull Requests]
+      operationId: getPullRequest
+      summary: Get one pull request
+      description: Pull request details, including check status and review state.
+      x-access: read
+      parameters:
+        - $ref: '#/components/parameters/PrId'
+      responses:
+        '200':
+          description: The pull request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PullRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /deployments:
+    post:
+      tags: [Deployments]
+      operationId: requestDeployment
+      summary: Request a deployment
+      description: |
+        Requests a deployment of a ref to an environment. Staging deploys
+        start right away. Production deploys are created as
+        `pending_approval` and only a human can approve them.
+      x-access: write
+      x-requires-approval: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [environment, ref]
+              properties:
+                environment:
+                  type: string
+                  enum: [staging, production]
+                ref:
+                  type: string
+                  description: Commit SHA or branch name to deploy.
+                note:
+                  type: string
+                  maxLength: 500
+                  description: Why this deploy is needed; shown to the approver.
+      responses:
+        '202':
+          description: Deployment accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Deployment'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /deployments/{deploymentId}:
+    get:
+      tags: [Deployments]
+      operationId: getDeployment
+      summary: Get deployment status
+      description: Current status of a deployment, including who approved it when approval was required.
+      x-access: read
+      parameters:
+        - $ref: '#/components/parameters/DeploymentId'
+      responses:
+        '200':
+          description: The deployment
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Deployment'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+
+  parameters:
+    IssueId:
+      name: issueId
+      in: path
+      required: true
+      schema:
+        type: string
+      example: ISS-142
+    RunId:
+      name: runId
+      in: path
+      required: true
+      schema:
+        type: string
+      example: run_8831
+    PrId:
+      name: prId
+      in: path
+      required: true
+      schema:
+        type: string
+      example: PR-57
+    DeploymentId:
+      name: deploymentId
+      in: path
+      required: true
+      schema:
+        type: string
+      example: dep_204
+    Limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    Cursor:
+      name: cursor
+      in: query
+      description: Opaque cursor from a previous response's `next_cursor`.
+      schema:
+        type: string
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid API key
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: The key is valid but not allowed to do this
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: The resource does not exist
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    ValidationError:
+      description: The request body or parameters are invalid
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          example: not_found
+        message:
+          type: string
+
+    Comment:
+      type: object
+      required: [id, body, author, created_at]
+      properties:
+        id:
+          type: string
+        body:
+          type: string
+        author:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    Issue:
+      type: object
+      required: [id, title, status]
+      properties:
+        id:
+          type: string
+          example: ISS-142
+        title:
+          type: string
+        description:
+          type: string
+        status:
+          type: string
+          enum: [open, in_progress, closed]
+        labels:
+          type: array
+          items:
+            type: string
+        assignee:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        comments:
+          type: array
+          description: Latest comments, present on single-issue reads.
+          items:
+            $ref: '#/components/schemas/Comment'
+
+    CiJob:
+      type: object
+      required: [name, status]
+      properties:
+        name:
+          type: string
+          example: unit-tests
+        status:
+          type: string
+          enum: [queued, running, passed, failed, cancelled]
+
+    CiRun:
+      type: object
+      required: [id, branch, commit_sha, status]
+      properties:
+        id:
+          type: string
+          example: run_8831
+        branch:
+          type: string
+        commit_sha:
+          type: string
+        status:
+          type: string
+          enum: [queued, running, passed, failed, cancelled]
+        jobs:
+          type: array
+          items:
+            $ref: '#/components/schemas/CiJob'
+        started_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    PullRequest:
+      type: object
+      required: [id, title, source_branch, target_branch, state]
+      properties:
+        id:
+          type: string
+          example: PR-57
+        title:
+          type: string
+        description:
+          type: string
+        source_branch:
+          type: string
+        target_branch:
+          type: string
+        state:
+          type: string
+          enum: [draft, open, merged, closed]
+        linked_issue_id:
+          type: string
+          nullable: true
+        checks_status:
+          type: string
+          enum: [pending, passing, failing]
+        review_status:
+          type: string
+          enum: [none, changes_requested, approved]
+
+    Deployment:
+      type: object
+      required: [id, environment, ref, status]
+      properties:
+        id:
+          type: string
+          example: dep_204
+        environment:
+          type: string
+          enum: [staging, production]
+        ref:
+          type: string
+        status:
+          type: string
+          enum: [pending_approval, in_progress, succeeded, failed, rejected]
+        requested_by:
+          type: string
+        approved_by:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time

@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpenAPI to MCP: Technical Flowchart</title>
+  <style>
+    :root {
+      --bg: #090d16;
+      --surface: #111827;
+      --surface-light: #1f2937;
+      --border: #374151;
+      --text: #f9fafb;
+      --text-muted: #9ca3af;
+      --cyan: #06b6d4;
+      --purple: #a855f7;
+      --emerald: #10b981;
+      --amber: #f59e0b;
+      --indigo: #6366f1;
+      --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font-sans);
+      padding: 36px 20px;
+      line-height: 1.5;
+    }
+
+    .container {
+      max-width: 1100px;
+      margin: 0 auto;
+    }
+
+    header {
+      text-align: center;
+      margin-bottom: 40px;
+    }
+
+    h1 {
+      font-size: 28px;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      color: #fff;
+    }
+
+    p.subtitle {
+      color: var(--text-muted);
+      font-size: 14px;
+      margin-top: 6px;
+    }
+
+    /* Section Headers */
+    .flow-section-title {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin: 40px 0 24px 0;
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .section-badge {
+      font-size: 11px;
+      font-weight: 800;
+      padding: 4px 10px;
+      border-radius: 9999px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .badge-setup { background: rgba(16, 185, 129, 0.2); color: var(--emerald); border: 1px solid var(--emerald); }
+    .badge-runtime { background: rgba(56, 189, 248, 0.2); color: var(--cyan); border: 1px solid var(--cyan); }
+
+    .section-text {
+      font-size: 18px;
+      font-weight: 700;
+      color: #fff;
+    }
+
+    /* Flowchart Container */
+    .flowchart {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      position: relative;
+    }
+
+    /* Flowchart Node Types */
+    .node {
+      background: var(--surface);
+      border: 2px solid var(--border);
+      border-radius: 12px;
+      padding: 14px 16px;
+      width: 100%;
+      max-width: 580px;
+      text-align: center;
+      position: relative;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+      transition: all 0.2s ease;
+      box-sizing: border-box;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+
+    .node:hover {
+      border-color: #60a5fa;
+      transform: translateY(-2px);
+    }
+
+    .node-start {
+      border-radius: 30px;
+      background: #1e293b;
+      border-color: #94a3b8;
+      font-weight: 700;
+    }
+
+    .node-decision {
+      background: #1e1b4b;
+      border-color: var(--indigo);
+      border-radius: 12px;
+      max-width: 480px;
+    }
+
+    .node-title {
+      font-size: 14px;
+      font-weight: 700;
+      color: #fff;
+    }
+
+    .node-desc {
+      font-size: 12px;
+      color: var(--text-muted);
+      margin-top: 4px;
+      line-height: 1.4;
+    }
+
+    .code-pill {
+      display: inline-block;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      background: #0f172a;
+      border: 1px solid rgba(255,255,255,0.1);
+      padding: 4px 10px;
+      border-radius: 6px;
+      color: #38bdf8;
+      margin-top: 6px;
+      max-width: 100%;
+      box-sizing: border-box;
+      word-break: break-all;
+      overflow-wrap: anywhere;
+      white-space: normal;
+    }
+
+    /* Connecting Arrows */
+    .arrow-down {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      height: 42px;
+      justify-content: center;
+      position: relative;
+    }
+
+    .arrow-line {
+      width: 2px;
+      height: 26px;
+      background: #4b5563;
+    }
+
+    .arrow-head {
+      width: 0; 
+      height: 0; 
+      border-left: 6px solid transparent;
+      border-right: 6px solid transparent;
+      border-top: 8px solid #4b5563;
+    }
+
+    .arrow-label {
+      font-size: 11px;
+      font-family: var(--font-mono);
+      color: var(--amber);
+      background: #111827;
+      padding: 1px 6px;
+      border-radius: 4px;
+      position: absolute;
+    }
+
+    /* Branch Container (Side-by-Side paths) */
+    .branch-container {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+      width: 100%;
+      margin: 12px 0;
+      position: relative;
+    }
+
+    .branch-path {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      background: rgba(17, 24, 39, 0.4);
+      border: 1px dashed var(--border);
+      border-radius: 16px;
+      padding: 18px 14px;
+      min-width: 0; /* Prevents grid blowout */
+      width: 100%;
+      box-sizing: border-box;
+    }
+
+    .branch-header {
+      font-size: 13px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 16px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .branch-litellm { color: var(--cyan); }
+    .branch-fastmcp { color: var(--purple); }
+
+    .node-litellm { border-color: rgba(6, 182, 212, 0.5); }
+    .node-litellm:hover { border-color: var(--cyan); }
+
+    .node-fastmcp { border-color: rgba(168, 85, 247, 0.5); }
+    .node-fastmcp:hover { border-color: var(--purple); }
+
+    /* Output Card */
+    .output-box {
+      background: #030712;
+      border: 1px solid #1f2937;
+      border-radius: 12px;
+      padding: 16px 20px;
+      width: 100%;
+      max-width: 680px;
+      margin-top: 10px;
+      box-sizing: border-box;
+      overflow: hidden;
+    }
+
+    .output-box pre {
+      margin: 0;
+      color: #a7f3d0;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+      overflow-x: auto;
+    }
+
+    .output-header {
+      color: var(--emerald);
+      font-weight: 700;
+      margin-bottom: 8px;
+      display: flex;
+      justify-content: space-between;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+
+<div class="container">
+
+  <header>
+    <h1>Technical Flowchart: OpenAPI ➔ MCP</h1>
+    <p class="subtitle">Complete visual flow of Phase 1 (Conversion/Setup) and Phase 2 (Client Execution)</p>
+  </header>
+
+  <!-- ========================================================================= -->
+  <!-- PHASE 1: CONVERSION & SETUP FLOWCHART -->
+  <!-- ========================================================================= -->
+
+  <div class="flow-section-title">
+    <span class="section-badge badge-setup">Phase 1</span>
+    <span class="section-text">How OpenAPI Converts into an MCP Server (Setup Time)</span>
+  </div>
+
+  <div class="flowchart">
+
+    <!-- Node 1: Input Spec -->
+    <div class="node node-start">
+      <div class="node-title">📄 1. Input: OpenAPI Specification</div>
+      <div class="node-desc">You provide <code>engineering-ops-api.yaml</code> / <code>.json</code></div>
+      <div class="code-pill">paths: { "/issues": { "get": { "operationId": "listIssues" } } }</div>
+    </div>
+
+    <!-- Arrow -->
+    <div class="arrow-down">
+      <div class="arrow-line"></div>
+      <div class="arrow-head"></div>
+    </div>
+
+    <!-- Decision / Fork -->
+    <div class="node node-decision">
+      <div class="node-title" style="color: #c7d2fe;">⚙️ Choose Conversion Engine</div>
+      <div class="node-desc">Which mechanism converts this spec into MCP tools?</div>
+    </div>
+
+    <!-- Split Branches -->
+    <div class="branch-container">
+
+      <!-- LEFT BRANCH: LiteLLM Native Conversion -->
+      <div class="branch-path">
+        <div class="branch-header branch-litellm">
+          <span>Track A: LiteLLM Native Conversion</span>
+        </div>
+
+        <div class="node node-litellm">
+          <div class="node-title">1. Config Mount</div>
+          <div class="node-desc">Mount JSON spec into LiteLLM container</div>
+          <div class="code-pill">config.yaml: spec_path: /app/specs/...</div>
+        </div>
+
+        <div class="arrow-down"><div class="arrow-line"></div><div class="arrow-head"></div></div>
+
+        <div class="node node-litellm">
+          <div class="node-title">2. In-Memory Parser</div>
+          <div class="node-desc">LiteLLM parses paths at startup & lowercases names</div>
+          <div class="code-pill">Tool: engineering_ops_mcp-listissues</div>
+        </div>
+
+        <div class="arrow-down"><div class="arrow-line"></div><div class="arrow-head"></div></div>
+
+        <div class="node node-litellm">
+          <div class="node-title">3. Tool Registration</div>
+          <div class="node-desc">Tool is registered inside LiteLLM Gateway memory</div>
+          <div class="code-pill">Ready on: http://localhost:4000/mcp</div>
+        </div>
+      </div>
+
+      <!-- RIGHT BRANCH: FastMCP Conversion -->
+      <div class="branch-path">
+        <div class="branch-header branch-fastmcp">
+          <span>Track B: FastMCP Framework</span>
+        </div>
+
+        <div class="node node-fastmcp">
+          <div class="node-title">1. Python Script Call</div>
+          <div class="node-desc">Call FastMCP SDK with spec & client</div>
+          <div class="code-pill">FastMCP.from_openapi(spec, client)</div>
+        </div>
+
+        <div class="arrow-down"><div class="arrow-line"></div><div class="arrow-head"></div></div>
+
+        <div class="node node-fastmcp">
+          <div class="node-title">2. Standalone SSE Server</div>
+          <div class="node-desc">Exposes SSE transport on port 8005 with MCP tool schemas</div>
+          <div class="code-pill">Tool: fastmcp_ops-listIssues (SSE :8005)</div>
+        </div>
+
+        <div class="arrow-down"><div class="arrow-line"></div><div class="arrow-head"></div></div>
+
+        <div class="node node-fastmcp">
+          <div class="node-title">3. Upstream Gateway Binding</div>
+          <div class="node-desc">Gateway config points to FastMCP SSE endpoint</div>
+          <div class="code-pill">mcp_servers:<br><span style="color:#94a3b8; font-size:10px;">http://host.docker.internal:8005/sse</span></div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Arrow merging to ready state -->
+    <div class="arrow-down">
+      <div class="arrow-line"></div>
+      <div class="arrow-head"></div>
+    </div>
+
+    <!-- Ready Node -->
+    <div class="node" style="border-color: var(--emerald); background: #064e3b; text-align: center;">
+      <div class="node-title" style="color: #a7f3d0;">✅ Setup Complete: 47 Tools Unified</div>
+      <div class="node-desc" style="color: #d1fae5;">All tools are now available behind single gateway endpoint: <code>http://localhost:4000/mcp</code></div>
+    </div>
+
+  </div>
+
+
+  <!-- ========================================================================= -->
+  <!-- PHASE 2: RUNTIME TOOL EXECUTION FLOWCHART -->
+  <!-- ========================================================================= -->
+
+  <div class="flow-section-title">
+    <span class="section-badge badge-runtime">Phase 2</span>
+    <span class="section-text">What Happens When Client (Claude Desktop) Calls a Tool</span>
+  </div>
+
+  <div class="flowchart">
+
+    <!-- Step 1: Client Call -->
+    <div class="node node-start">
+      <div class="node-title">🤖 1. Client Trigger (Claude Desktop)</div>
+      <div class="node-desc">User asks: <em>"Please check open issues using fastmcp_ops-listIssues"</em></div>
+      <div class="code-pill">JSON-RPC tools/call: { "name": "fastmcp_ops-listIssues", "arguments": {} }</div>
+    </div>
+
+    <div class="arrow-down">
+      <div class="arrow-line"></div>
+      <div class="arrow-head"></div>
+    </div>
+
+    <!-- Step 2: Gateway Interception -->
+    <div class="node" style="border-color: var(--indigo); background: #1e1b4b; max-width: 550px;">
+      <div class="node-title" style="color: #c7d2fe;">🛡️ 2. AI Gateway Interception (:4000)</div>
+      <div class="node-desc" style="color: #cbd5e1; text-align: left; padding: 6px 12px; line-height: 1.6;">
+        • <strong>Authentication:</strong> Validates <code>Bearer sk-agent-claude-desktop</code><br>
+        • <strong>Tool Policy Check:</strong> Is <code>listIssues</code> allowed for this key? (Allowed!)<br>
+        • <strong>Audit Ledger:</strong> Records execution in DB (<code>user: claude-desktop</code>)<br>
+        • <strong>Zero Data Retention:</strong> Ensures no sensitive prompts are persisted.
+      </div>
+    </div>
+
+    <div class="arrow-down">
+      <div class="arrow-line"></div>
+      <div class="arrow-head"></div>
+    </div>
+
+    <!-- Step 3: Routing Decision -->
+    <div class="node node-decision">
+      <div class="node-title" style="color: #c7d2fe;">🔀 3. Gateway Routes the Tool Call</div>
+      <div class="node-desc">Where is this tool hosted?</div>
+    </div>
+
+    <!-- Side-by-Side Execution Paths -->
+    <div class="branch-container">
+
+      <!-- Track A Runtime -->
+      <div class="branch-path">
+        <div class="branch-header branch-litellm">If LiteLLM Native Tool:</div>
+        <div class="node node-litellm">
+          <div class="node-title">Direct Outbound HTTP Call</div>
+          <div class="node-desc">Gateway itself sends HTTP GET over network:</div>
+          <div class="code-pill">GET /api/v1/issues<br><span style="color:#94a3b8; font-size:10px;">http://host.docker.internal:8089</span></div>
+        </div>
+      </div>
+
+      <!-- Track B Runtime -->
+      <div class="branch-path">
+        <div class="branch-header branch-fastmcp">If FastMCP Tool:</div>
+        <div class="node node-fastmcp">
+          <div class="node-title">SSE Forward ➔ Outbound HTTP Call</div>
+          <div class="node-desc">Gateway forwards call over SSE to port 8005. FastMCP's HTTP client executes request to target REST API:</div>
+          <div class="code-pill">httpx.get("/api/v1/issues")<br><span style="color:#94a3b8; font-size:10px;">target: host.docker.internal:8089</span></div>
+        </div>
+      </div>
+
+    </div>
+
+    <div class="arrow-down">
+      <div class="arrow-line"></div>
+      <div class="arrow-head"></div>
+    </div>
+
+    <!-- Step 4: Backend Service -->
+    <div class="node" style="border-color: var(--emerald); background: #064e3b;">
+      <div class="node-title" style="color: #a7f3d0;">🎯 4. Target Backend (Mock Service :8089)</div>
+      <div class="node-desc" style="color: #d1fae5;">Executes business logic and returns HTTP 200 OK with real issues JSON:</div>
+      <div class="code-pill" style="color:#d1fae5;">[ { "id": "ISS-142", "title": "Memory leak...", "status": "open" }, ... ]</div>
+    </div>
+
+    <div class="arrow-down">
+      <div class="arrow-line"></div>
+      <div class="arrow-head"></div>
+    </div>
+
+    <!-- Step 5: Packaging & Response -->
+    <div class="node" style="border-color: #38bdf8;">
+      <div class="node-title">📦 5. Envelope Packaging & Return</div>
+      <div class="node-desc">Engine wraps HTTP response into standard MCP envelope: <code>isError: false</code>. Gateway delivers it back to Claude Desktop.</div>
+    </div>
+
+    <div class="arrow-down">
+      <div class="arrow-line"></div>
+      <div class="arrow-head"></div>
+    </div>
+
+    <!-- Final Output Payload Box -->
+    <div class="output-box">
+      <div class="output-header">
+        <span>6. OUTPUT: What Claude Desktop Receives</span>
+        <span>STATUS: 200 OK</span>
+      </div>
+      <pre>{
+  "jsonrpc": "2.0",
+  "result": {
+    "isError": false,
+    "structuredContent": {
+      "items": [
+        {
+          "id": "ISS-142",
+          "title": "Memory leak in telemetry worker",
+          "status": "open",
+          "assignee": "kavyakapoor"
+        },
+        {
+          "id": "ISS-101",
+          "title": "Fix flaky CI test in gateway auth suite",
+          "status": "in_progress",
+          "assignee": "alex"
+        }
+      ]
+    }
+  }
+}</pre>
+    </div>
+
+  </div>
+
+</div>
+
+</body>
+</html>

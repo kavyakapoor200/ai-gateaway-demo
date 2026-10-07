@@ -13,6 +13,7 @@ import json
 import hashlib
 import sqlite3
 import socket
+import collections
 from urllib.parse import urlparse, parse_qs
 from typing import Optional, Dict, Any, List
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -61,6 +62,15 @@ def get_db_stats() -> Dict[str, Any]:
         "verified_tasks": 0,
         "total_spend": 0.0,
         "avg_cps": 0.0,
+        "fully_loaded_cps": 0.0,
+        "success_rate": 0.0,
+        "spend_by_outcome": {
+            "merged": 0.0,
+            "closed_unmerged": 0.0,
+            "pending": 0.0,
+            "blocked_by_policy": 0.0,
+            "other": 0.0
+        },
         "zdr_status": "UNKNOWN"
     }
     try:
@@ -75,7 +85,7 @@ def get_db_stats() -> Dict[str, Any]:
             stats["total_records"] = zdr_row["total_records"] or 0
             stats["zdr_status"] = zdr_row["compliance_status"] or "COMPLIANT"
 
-        # CPS summaries
+        # 1. Existing Nominal CPS (kept unchanged from v_coding_cps_summary as instructed)
         cur.execute("""
             SELECT 
                 COUNT(*) AS total_tasks,
@@ -85,11 +95,97 @@ def get_db_stats() -> Dict[str, Any]:
             FROM v_coding_cps_summary
         """)
         s_row = cur.fetchone()
+        nominal_avg_cps = 0.0
         if s_row:
-            stats["total_tasks"] = s_row["total_tasks"] or 0
-            stats["verified_tasks"] = s_row["verified_tasks"] or 0
-            stats["total_spend"] = s_row["total_spend"] or 0.0
-            stats["avg_cps"] = s_row["avg_cps"] or 0.0
+            nominal_avg_cps = s_row["avg_cps"] or 0.0
+        stats["avg_cps"] = nominal_avg_cps
+
+        # Total spend across all ledger records (including any untracked rows)
+        cur.execute("SELECT ROUND(COALESCE(SUM(cost_usd), 0.0), 6) AS total_ledger_spend FROM gateway_audit_ledger")
+        t_row = cur.fetchone()
+        if t_row and t_row["total_ledger_spend"] is not None:
+            stats["total_spend"] = float(t_row["total_ledger_spend"])
+
+        # 2. New Task-Level Query (1 task = 1 unit, spend summed per task_id, outcome precedence)
+        # Precedence: merged > closed_unmerged > blocked_by_policy > failed > pending
+        # 'failed' mapped into 'closed_unmerged' as decided.
+        cur.execute("""
+            WITH task_aggregates AS (
+                SELECT 
+                    task_id,
+                    SUM(cost_usd) AS task_spend,
+                    CASE
+                        WHEN SUM(CASE WHEN task_outcome = 'verified_success' THEN 1 ELSE 0 END) > 0 THEN 'merged'
+                        WHEN SUM(CASE WHEN task_outcome = 'unmerged_closed' THEN 1 ELSE 0 END) > 0 THEN 'closed_unmerged'
+                        WHEN SUM(CASE WHEN task_outcome = 'tool_policy_rejected' THEN 1 ELSE 0 END) > 0 THEN 'blocked_by_policy'
+                        WHEN SUM(CASE WHEN task_outcome = 'failed' THEN 1 ELSE 0 END) > 0 THEN 'closed_unmerged'
+                        WHEN SUM(CASE WHEN task_outcome = 'pending' THEN 1 ELSE 0 END) > 0 THEN 'pending'
+                        ELSE 'other'
+                    END AS task_resolved_outcome
+                FROM gateway_audit_ledger
+                WHERE task_id IS NOT NULL
+                GROUP BY task_id
+            )
+            SELECT 
+                COUNT(*) AS total_tasks_task_level,
+                SUM(CASE WHEN task_resolved_outcome = 'merged' THEN 1 ELSE 0 END) AS merged_tasks_count,
+                ROUND(SUM(task_spend), 6) AS all_task_spend,
+                ROUND(SUM(CASE WHEN task_resolved_outcome = 'merged' THEN task_spend ELSE 0.0 END), 6) AS spend_merged,
+                ROUND(SUM(CASE WHEN task_resolved_outcome = 'closed_unmerged' THEN task_spend ELSE 0.0 END), 6) AS spend_closed_unmerged,
+                ROUND(SUM(CASE WHEN task_resolved_outcome = 'pending' THEN task_spend ELSE 0.0 END), 6) AS spend_pending,
+                ROUND(SUM(CASE WHEN task_resolved_outcome = 'blocked_by_policy' THEN task_spend ELSE 0.0 END), 6) AS spend_blocked_by_policy,
+                ROUND(SUM(CASE WHEN task_resolved_outcome = 'other' THEN task_spend ELSE 0.0 END), 6) AS spend_other
+            FROM task_aggregates
+        """)
+        t_agg = cur.fetchone()
+        
+        total_tasks = 0
+        merged_tasks = 0
+        all_task_spend = 0.0
+        spend_merged = 0.0
+        spend_closed_unmerged = 0.0
+        spend_pending = 0.0
+        spend_blocked_by_policy = 0.0
+        spend_other = 0.0
+
+        if t_agg:
+            total_tasks = t_agg["total_tasks_task_level"] or 0
+            merged_tasks = t_agg["merged_tasks_count"] or 0
+            all_task_spend = float(t_agg["all_task_spend"] or 0.0)
+            spend_merged = float(t_agg["spend_merged"] or 0.0)
+            spend_closed_unmerged = float(t_agg["spend_closed_unmerged"] or 0.0)
+            spend_pending = float(t_agg["spend_pending"] or 0.0)
+            spend_blocked_by_policy = float(t_agg["spend_blocked_by_policy"] or 0.0)
+            spend_other = float(t_agg["spend_other"] or 0.0)
+
+        # Check for untracked spend (task_id IS NULL) to ensure buckets strictly sum to total spend
+        cur.execute("SELECT ROUND(COALESCE(SUM(cost_usd), 0.0), 6) AS untracked_spend FROM gateway_audit_ledger WHERE task_id IS NULL")
+        u_row = cur.fetchone()
+        untracked = float(u_row["untracked_spend"]) if u_row and u_row["untracked_spend"] else 0.0
+        spend_other = round(spend_other + untracked, 6)
+
+        stats["total_tasks"] = total_tasks
+        stats["verified_tasks"] = merged_tasks
+        
+        # Fully-loaded CPS: all task spend / merged tasks
+        if merged_tasks > 0:
+            stats["fully_loaded_cps"] = round(all_task_spend / merged_tasks, 6)
+        else:
+            stats["fully_loaded_cps"] = 0.0
+
+        # Success rate: merged tasks / total tasks (0.0 - 1.0 ratio)
+        if total_tasks > 0:
+            stats["success_rate"] = round(merged_tasks / total_tasks, 4)
+        else:
+            stats["success_rate"] = 0.0
+
+        stats["spend_by_outcome"] = {
+            "merged": spend_merged,
+            "closed_unmerged": spend_closed_unmerged,
+            "pending": spend_pending,
+            "blocked_by_policy": spend_blocked_by_policy,
+            "other": spend_other
+        }
             
         conn.close()
     except Exception as e:
@@ -117,26 +213,30 @@ def get_recent_audit_records(limit: int = 50, query: Optional[str] = None) -> Li
         conn = sqlite3.connect(db_path, timeout=5.0)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
+        cur.execute("PRAGMA table_info(gateway_audit_ledger);")
+        cols = {row["name"] for row in cur.fetchall()}
+        sec_cols = ", policy_action, violating_tools" if "policy_action" in cols else ""
+
         if query and query.strip():
             q = query.strip()
-            cur.execute("""
+            cur.execute(f"""
                 SELECT request_id, trace_id, created_at, api_key_alias, caller_role,
                        model_requested, model_routed, http_status, latency_ms,
                        prompt_tokens, completion_tokens, cost_usd,
                        prompt_sha256, completion_sha256, zdr_verified,
-                       task_id, task_outcome
+                       task_id, task_outcome{sec_cols}
                 FROM gateway_audit_ledger
                 WHERE request_id LIKE ? OR task_id LIKE ? OR trace_id LIKE ? OR api_key_alias LIKE ?
                 ORDER BY created_at DESC
                 LIMIT ?
             """, (f"%{q}%", f"%{q}%", f"%{q}%", f"%{q}%", limit))
         else:
-            cur.execute("""
+            cur.execute(f"""
                 SELECT request_id, trace_id, created_at, api_key_alias, caller_role,
                        model_requested, model_routed, http_status, latency_ms,
                        prompt_tokens, completion_tokens, cost_usd,
                        prompt_sha256, completion_sha256, zdr_verified,
-                       task_id, task_outcome
+                       task_id, task_outcome{sec_cols}
                 FROM gateway_audit_ledger
                 ORDER BY created_at DESC
                 LIMIT ?
@@ -146,6 +246,188 @@ def get_recent_audit_records(limit: int = 50, query: Optional[str] = None) -> Li
     except Exception as e:
         print(f"[!] get_recent_audit_records error: {e}", file=sys.stderr)
     return rows
+
+KNOWN_RISKY_TOOLS = {
+    "execute_command", "drop_table", "bash", "terminal", "query_db",
+    "create_user_profile", "read_file", "git_status", "git_diff",
+    "write_file", "delete_file"
+}
+
+def get_security_stats(db_path: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Computes security and tool governance statistics from gateway_audit_ledger:
+    - Blocked (strict_reject) and Filtered (filter) totals.
+    - Top blocked tools.
+    - Breakdown by key, role, and tool.
+    - Estimated spend avoided for strict_reject (blocked requests x model avg request cost).
+    """
+    if db_path is None:
+        db_path = get_db_path()
+    stats = {
+        "strict_rejections_count": 0,
+        "virtual_shielding_count": 0,
+        "total_blocked": 0,
+        "total_filtered": 0,
+        "spend_avoided_estimated_usd": 0.0,
+        "spend_avoided_display": "n/a (Estimated)",
+        "has_spend_avoided": False,
+        "top_blocked_tools": [],
+        "by_key": [],
+        "by_role": [],
+        "by_tool": [],
+        "by_key_role": [],
+        "policy_actions_counter": {}  # {(key, role, tool, action): count}
+    }
+    try:
+        conn = sqlite3.connect(db_path, timeout=5.0)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        cur.execute("PRAGMA table_info(gateway_audit_ledger);")
+        cols = {row["name"] for row in cur.fetchall()}
+        if "policy_action" not in cols:
+            conn.close()
+            return stats
+
+        # 1. Total counts
+        cur.execute("SELECT COUNT(*) FROM gateway_audit_ledger WHERE policy_action = 'strict_reject'")
+        stats["total_blocked"] = cur.fetchone()[0] or 0
+        stats["strict_rejections_count"] = stats["total_blocked"]
+
+        cur.execute("SELECT COUNT(*) FROM gateway_audit_ledger WHERE policy_action = 'filter'")
+        stats["total_filtered"] = cur.fetchone()[0] or 0
+        stats["virtual_shielding_count"] = stats["total_filtered"]
+
+        # 2. Estimated Spend Avoided (Strict Reject only, per request, model-isolated)
+        cur.execute("""
+            SELECT model_requested, COUNT(*) as blocked_count
+            FROM gateway_audit_ledger
+            WHERE policy_action = 'strict_reject'
+            GROUP BY model_requested
+        """)
+        blocked_by_model = cur.fetchall()
+
+        total_spend_avoided = 0.0
+        has_any_cost_history = False
+
+        for b_row in blocked_by_model:
+            m_name = b_row["model_requested"]
+            b_cnt = b_row["blocked_count"]
+            cur.execute("""
+                SELECT AVG(cost_usd) as avg_cost, COUNT(*) as cost_cnt
+                FROM gateway_audit_ledger
+                WHERE model_requested = ? AND cost_usd > 0
+            """, (m_name,))
+            c_row = cur.fetchone()
+            if c_row and c_row["cost_cnt"] and c_row["cost_cnt"] > 0 and c_row["avg_cost"] is not None:
+                has_any_cost_history = True
+                total_spend_avoided += b_cnt * float(c_row["avg_cost"])
+
+        if has_any_cost_history and stats["total_blocked"] > 0:
+            stats["spend_avoided_estimated_usd"] = round(total_spend_avoided, 6)
+            stats["spend_avoided_display"] = f"${total_spend_avoided:.4f} (Estimated)"
+            stats["has_spend_avoided"] = True
+        else:
+            stats["spend_avoided_estimated_usd"] = 0.0
+            stats["spend_avoided_display"] = "n/a (Estimated)"
+            stats["has_spend_avoided"] = False
+
+        # 3. Process violating tools and breakdowns
+        k_col = "api_key_alias" if "api_key_alias" in cols else "key_alias"
+        cur.execute(f"""
+            SELECT {k_col} as key_alias, caller_role, policy_action, violating_tools
+            FROM gateway_audit_ledger
+            WHERE policy_action IS NOT NULL
+        """)
+        rows = cur.fetchall()
+
+        tool_intercept_counts = collections.defaultdict(int)
+        tool_blocked_counts = collections.defaultdict(int)
+        tool_filtered_counts = collections.defaultdict(int)
+        key_breakdown = collections.defaultdict(lambda: {"blocked": 0, "filtered": 0, "role": "developer"})
+        role_breakdown = collections.defaultdict(lambda: {"blocked": 0, "filtered": 0})
+        policy_counter = collections.defaultdict(int)
+
+        for r in rows:
+            k = r["key_alias"] or "unknown"
+            role = r["caller_role"] or "developer"
+            action = r["policy_action"]  # 'strict_reject' or 'filter'
+
+            if action == "strict_reject":
+                key_breakdown[k]["blocked"] += 1
+                role_breakdown[role]["blocked"] += 1
+            elif action == "filter":
+                key_breakdown[k]["filtered"] += 1
+                role_breakdown[role]["filtered"] += 1
+            key_breakdown[k]["role"] = role
+
+            v_raw = r["violating_tools"]
+            tools = []
+            if v_raw:
+                try:
+                    tools = json.loads(v_raw) if isinstance(v_raw, str) else v_raw
+                    if not isinstance(tools, list):
+                        tools = [str(tools)]
+                except Exception:
+                    tools = [t.strip() for t in v_raw.split(",") if t.strip()]
+
+            for t in tools:
+                tool_intercept_counts[t] += 1
+                if action == "strict_reject":
+                    tool_blocked_counts[t] += 1
+                elif action == "filter":
+                    tool_filtered_counts[t] += 1
+
+                # Prometheus bucketing: allowlist or 'other'
+                p_tool = t if t in KNOWN_RISKY_TOOLS else "other"
+                policy_counter[(k, role, p_tool, action)] += 1
+
+        # Top blocked tools (sorted by total intercepts desc)
+        sorted_tools = sorted(tool_intercept_counts.items(), key=lambda x: x[1], reverse=True)
+        stats["top_blocked_tools"] = [
+            {"tool": t, "count": c, "blocked": tool_blocked_counts[t], "filtered": tool_filtered_counts[t]}
+            for t, c in sorted_tools
+        ]
+        stats["blocked_tools"] = [
+            {"tool": t, "count": c}
+            for t, c in sorted(tool_blocked_counts.items(), key=lambda x: x[1], reverse=True)
+        ]
+        stats["filtered_tools"] = [
+            {"tool": t, "count": c}
+            for t, c in sorted(tool_filtered_counts.items(), key=lambda x: x[1], reverse=True)
+        ]
+
+        # By Key list
+        stats["by_key"] = [
+            {"key": k, "role": v["role"], "blocked": v["blocked"], "filtered": v["filtered"]}
+            for k, v in key_breakdown.items()
+        ]
+
+        # By Key & Role list for dashboard
+        stats["by_key_role"] = [
+            {"key_alias": k, "role": v["role"], "blocked": v["blocked"], "filtered": v["filtered"]}
+            for k, v in key_breakdown.items()
+        ]
+
+        # By Role list
+        stats["by_role"] = [
+            {"role": role, "blocked": v["blocked"], "filtered": v["filtered"]}
+            for role, v in role_breakdown.items()
+        ]
+
+        # By Tool summary
+        all_tool_names = set(tool_blocked_counts.keys()) | set(tool_filtered_counts.keys())
+        stats["by_tool"] = [
+            {"tool": t, "blocked": tool_blocked_counts[t], "filtered": tool_filtered_counts[t]}
+            for t in sorted(all_tool_names)
+        ]
+
+        stats["policy_actions_counter"] = policy_counter
+        conn.close()
+    except Exception as e:
+        print(f"[!] get_security_stats error: {e}", file=sys.stderr)
+
+    return stats
 
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -576,14 +858,165 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="metric-sub">Real-Time Micro-Cent Token Card</div>
       </div>
       <div class="metric-card" style="--card-accent: var(--accent-amber);">
-        <div class="metric-label">Average Cost / Success</div>
+        <div class="metric-label">Nominal CPS (Merged Only)</div>
         <div class="metric-value" id="kpi-avg-cps" style="color: var(--accent-amber);">$0.00</div>
-        <div class="metric-sub">Cost Per Successful Task (CPS)</div>
+        <div class="metric-sub">Cost / Successful Task</div>
+      </div>
+      <div class="metric-card" style="--card-accent: #f43f5e;">
+        <div class="metric-label">Fully-Loaded CPS</div>
+        <div class="metric-value" id="kpi-fully-loaded-cps" style="color: #fb7185;">$0.00</div>
+        <div class="metric-sub" id="kpi-fully-loaded-sub">All Task Spend / Merged Tasks</div>
+      </div>
+      <div class="metric-card" style="--card-accent: #38bdf8;">
+        <div class="metric-label">Task Success Rate</div>
+        <div class="metric-value" id="kpi-success-rate" style="color: #38bdf8;">0.0%</div>
+        <div class="metric-sub" id="kpi-success-rate-sub">0 of 0 tasks merged</div>
       </div>
       <div class="metric-card" style="--card-accent: var(--accent-emerald);">
         <div class="metric-label">ZDR Invariant Status</div>
         <div class="metric-value" id="kpi-zdr-status" style="font-size: 1.125rem; font-weight: 600; color: var(--accent-emerald); padding-top: 8px;">100% COMPLIANT</div>
         <div class="metric-sub">0 Bytes Plaintext Persisted</div>
+      </div>
+    </div>
+
+    <!-- Executive Section: Where the Money Went Breakdown -->
+    <div class="section-box">
+      <div class="section-header">
+        <div class="section-title">
+          <span>Where the Money Went (Capital Allocation)</span>
+          <span class="badge-count" id="badge-spend-total">$0.00 Total</span>
+        </div>
+        <div style="font-size: 0.8125rem; color: var(--text-dim);">Financial breakdown by task outcome: Merged vs Closed Unmerged vs Pending vs Policy Blocked</div>
+      </div>
+      <div style="padding: 20px 24px;">
+        <!-- Visual Progress Bar -->
+        <div id="spend-bar" style="display: flex; height: 14px; border-radius: 7px; overflow: hidden; background: rgba(255,255,255,0.06); margin-bottom: 20px;">
+          <div id="bar-merged" style="background: #10b981; width: 0%; transition: width 0.4s ease;" title="Merged"></div>
+          <div id="bar-closed" style="background: #f43f5e; width: 0%; transition: width 0.4s ease;" title="Closed Unmerged"></div>
+          <div id="bar-pending" style="background: #f59e0b; width: 0%; transition: width 0.4s ease;" title="Pending"></div>
+          <div id="bar-blocked" style="background: #8b5cf6; width: 0%; transition: width 0.4s ease;" title="Blocked by Policy"></div>
+          <div id="bar-other" style="background: #64748b; width: 0%; transition: width 0.4s ease;" title="Other"></div>
+        </div>
+        <!-- Metric Grid for Categories -->
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px;">
+          <div style="background: rgba(16, 185, 129, 0.08); border: 1px solid rgba(16, 185, 129, 0.2); border-radius: 10px; padding: 12px 16px;">
+            <div style="display: flex; align-items: center; gap: 8px; font-size: 0.8125rem; color: #34d399; font-weight: 600;">
+              <span style="width: 8px; height: 8px; border-radius: 50%; background: #10b981;"></span> Merged (Productive)
+            </div>
+            <div id="spend-val-merged" style="font-size: 1.25rem; font-weight: 700; color: #ffffff; margin-top: 6px;">$0.0000</div>
+            <div id="spend-pct-merged" style="font-size: 0.75rem; color: var(--text-dim);">0.0% of total spend</div>
+          </div>
+          <div style="background: rgba(244, 63, 94, 0.08); border: 1px solid rgba(244, 63, 94, 0.2); border-radius: 10px; padding: 12px 16px;">
+            <div style="display: flex; align-items: center; gap: 8px; font-size: 0.8125rem; color: #fb7185; font-weight: 600;">
+              <span style="width: 8px; height: 8px; border-radius: 50%; background: #f43f5e;"></span> Closed Unmerged (Waste)
+            </div>
+            <div id="spend-val-closed" style="font-size: 1.25rem; font-weight: 700; color: #ffffff; margin-top: 6px;">$0.0000</div>
+            <div id="spend-pct-closed" style="font-size: 0.75rem; color: var(--text-dim);">0.0% of total spend</div>
+          </div>
+          <div style="background: rgba(245, 158, 11, 0.08); border: 1px solid rgba(245, 158, 11, 0.2); border-radius: 10px; padding: 12px 16px;">
+            <div style="display: flex; align-items: center; gap: 8px; font-size: 0.8125rem; color: #fbbf24; font-weight: 600;">
+              <span style="width: 8px; height: 8px; border-radius: 50%; background: #f59e0b;"></span> Pending (In-Flight)
+            </div>
+            <div id="spend-val-pending" style="font-size: 1.25rem; font-weight: 700; color: #ffffff; margin-top: 6px;">$0.0000</div>
+            <div id="spend-pct-pending" style="font-size: 0.75rem; color: var(--text-dim);">0.0% of total spend</div>
+          </div>
+          <div style="background: rgba(139, 92, 246, 0.08); border: 1px solid rgba(139, 92, 246, 0.2); border-radius: 10px; padding: 12px 16px;">
+            <div style="display: flex; align-items: center; gap: 8px; font-size: 0.8125rem; color: #a78bfa; font-weight: 600;">
+              <span style="width: 8px; height: 8px; border-radius: 50%; background: #8b5cf6;"></span> Blocked by Policy
+            </div>
+            <div id="spend-val-blocked" style="font-size: 1.25rem; font-weight: 700; color: #ffffff; margin-top: 6px;">$0.0000</div>
+            <div id="spend-pct-blocked" style="font-size: 0.75rem; color: var(--text-dim);">0.0% of total spend</div>
+          </div>
+          <div style="background: rgba(100, 116, 139, 0.08); border: 1px solid rgba(100, 116, 139, 0.2); border-radius: 10px; padding: 12px 16px;">
+            <div style="display: flex; align-items: center; gap: 8px; font-size: 0.8125rem; color: #94a3b8; font-weight: 600;">
+              <span style="width: 8px; height: 8px; border-radius: 50%; background: #64748b;"></span> Other / Fallback
+            </div>
+            <div id="spend-val-other" style="font-size: 1.25rem; font-weight: 700; color: #ffffff; margin-top: 6px;">$0.0000</div>
+            <div id="spend-pct-other" style="font-size: 0.75rem; color: var(--text-dim);">0.0% of total spend</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Executive Section: CISO Security & Tool Policy Intercepts -->
+    <div class="section-box" style="border: 1px solid rgba(239, 68, 68, 0.25); background: rgba(18, 24, 38, 0.85);">
+      <div class="section-header" style="border-bottom: 1px solid rgba(239, 68, 68, 0.15);">
+        <div class="section-title">
+          <span style="display: flex; align-items: center; gap: 8px;">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#f87171" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+            What Did The Gateway Stop? (CISO Security Governance)
+          </span>
+          <span class="badge-count" id="badge-sec-blocked" style="background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.4);">0 Blocked</span>
+          <span class="badge-count" id="badge-sec-filtered" style="background: rgba(139, 92, 246, 0.2); color: #c084fc; border: 1px solid rgba(139, 92, 246, 0.4);">0 Filtered</span>
+        </div>
+        <div style="font-size: 0.8125rem; color: var(--text-dim);">Real-time ingress audit of disallowed tool executions, virtual shielding &amp; estimated financial loss avoided</div>
+      </div>
+      <div style="padding: 20px 24px;">
+        <!-- Top Metrics Cards -->
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 20px;">
+          <div style="background: rgba(239, 68, 68, 0.08); border: 1px solid rgba(239, 68, 68, 0.2); border-radius: 10px; padding: 14px 18px;">
+            <div style="font-size: 0.8125rem; color: #f87171; font-weight: 600;">Strict Rejections (Blocked)</div>
+            <div id="sec-val-blocked" style="font-size: 1.5rem; font-weight: 700; color: #ffffff; margin-top: 6px;">0</div>
+            <div style="font-size: 0.75rem; color: var(--text-dim);">HTTP 403 Stop &bull; 0 Upstream Tokens</div>
+          </div>
+          <div style="background: rgba(139, 92, 246, 0.08); border: 1px solid rgba(139, 92, 246, 0.2); border-radius: 10px; padding: 14px 18px;">
+            <div style="font-size: 0.8125rem; color: #c084fc; font-weight: 600;">Virtual Shielding (Filtered)</div>
+            <div id="sec-val-filtered" style="font-size: 1.5rem; font-weight: 700; color: #ffffff; margin-top: 6px;">0</div>
+            <div style="font-size: 0.75rem; color: var(--text-dim);">HTTP 200 OK &bull; Disallowed Tools Pruned</div>
+          </div>
+          <div style="background: rgba(16, 185, 129, 0.08); border: 1px solid rgba(16, 185, 129, 0.2); border-radius: 10px; padding: 14px 18px;">
+            <div style="font-size: 0.8125rem; color: #34d399; font-weight: 600;">Estimated Spend Avoided</div>
+            <div id="sec-val-spend-avoided" style="font-size: 1.5rem; font-weight: 700; color: #34d399; margin-top: 6px;">n/a (Estimated)</div>
+            <div style="font-size: 0.75rem; color: var(--text-dim);">Blocked Calls &times; Model Historical Avg Cost</div>
+          </div>
+        </div>
+
+        <!-- 3 Column Breakdown: Strictly Blocked Tools + Filtered Tools + Key/Role -->
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px;">
+          <!-- Left: Strictly Blocked Tools -->
+          <div style="background: rgba(15, 23, 42, 0.5); border: 1px solid rgba(239, 68, 68, 0.25); border-radius: 10px; padding: 16px;">
+            <div style="font-size: 0.875rem; font-weight: 600; color: #f87171; margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between;">
+              <span>🛑 Strictly Blocked Tools</span>
+              <span id="badge-tools-blocked-cnt" style="font-size: 0.72rem; background: rgba(239, 68, 68, 0.2); color: #fca5a5; padding: 2px 7px; border-radius: 8px;">0 tools</span>
+            </div>
+            <div id="sec-tools-blocked-list" style="display: flex; flex-direction: column; gap: 8px; max-height: 250px; overflow-y: auto;">
+              <div style="color: var(--text-dim); font-size: 0.8125rem;">No strictly blocked tools recorded yet.</div>
+            </div>
+          </div>
+
+          <!-- Middle: Filtered Out Tools (Virtual Shielding) -->
+          <div style="background: rgba(15, 23, 42, 0.5); border: 1px solid rgba(139, 92, 246, 0.25); border-radius: 10px; padding: 16px;">
+            <div style="font-size: 0.875rem; font-weight: 600; color: #c084fc; margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between;">
+              <span>🛡️ Filtered Out Tools</span>
+              <span id="badge-tools-filtered-cnt" style="font-size: 0.72rem; background: rgba(139, 92, 246, 0.2); color: #c084fc; padding: 2px 7px; border-radius: 8px;">0 tools</span>
+            </div>
+            <div id="sec-tools-filtered-list" style="display: flex; flex-direction: column; gap: 8px; max-height: 250px; overflow-y: auto;">
+              <div style="color: var(--text-dim); font-size: 0.8125rem;">No filtered tools recorded yet.</div>
+            </div>
+          </div>
+
+          <!-- Right: Breakdown by API Key & Role -->
+          <div style="background: rgba(15, 23, 42, 0.5); border: 1px solid var(--border-subtle); border-radius: 10px; padding: 16px;">
+            <div style="font-size: 0.875rem; font-weight: 600; color: var(--text-main); margin-bottom: 12px;">
+              Policy Actions by Key &amp; Role
+            </div>
+            <div class="table-container">
+              <table style="font-size: 0.8125rem;">
+                <thead>
+                  <tr>
+                    <th style="padding: 8px 12px;">API Key Alias</th>
+                    <th style="padding: 8px 12px;">Role</th>
+                    <th style="padding: 8px 12px;">Blocked</th>
+                    <th style="padding: 8px 12px;">Filtered</th>
+                  </tr>
+                </thead>
+                <tbody id="tbody-sec-keys">
+                  <tr><td colspan="4" style="text-align:center; color: var(--text-dim); padding: 12px;">No key violations logged.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -682,11 +1115,71 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           ? `/api/audit?q=${encodeURIComponent(currentSearchQuery)}`
           : '/api/audit';
 
-        const [statsRes, cpsRes, auditRes] = await Promise.all([
+        const [statsRes, cpsRes, auditRes, secRes] = await Promise.all([
           fetch('/api/stats').then(r => r.json()),
           fetch('/api/cps').then(r => r.json()),
-          fetch(auditUrl).then(r => r.json())
+          fetch(auditUrl).then(r => r.json()),
+          fetch('/api/security').then(r => r.json()).catch(() => ({}))
         ]);
+
+        // Security Governance Panel
+        if (secRes) {
+          const blocked = secRes.strict_rejections_count || 0;
+          const filtered = secRes.virtual_shielding_count || 0;
+          document.getElementById('badge-sec-blocked').textContent = `${blocked} Blocked`;
+          document.getElementById('badge-sec-filtered').textContent = `${filtered} Filtered`;
+          document.getElementById('sec-val-blocked').textContent = blocked;
+          document.getElementById('sec-val-filtered').textContent = filtered;
+          document.getElementById('sec-val-spend-avoided').textContent = secRes.spend_avoided_display || 'n/a (Estimated)';
+
+          // Strictly Blocked Tools list
+          const bToolsEl = document.getElementById('sec-tools-blocked-list');
+          const bTools = secRes.blocked_tools || [];
+          const bBadge = document.getElementById('badge-tools-blocked-cnt');
+          if (bBadge) bBadge.textContent = `${bTools.length} tools`;
+          if (bTools.length === 0) {
+            bToolsEl.innerHTML = '<div style="color: var(--text-dim); font-size: 0.8125rem;">No strictly blocked tools recorded yet.</div>';
+          } else {
+            bToolsEl.innerHTML = bTools.map(item => `
+              <div style="display: flex; justify-content: space-between; align-items: center; padding: 6px 10px; background: rgba(30, 41, 59, 0.4); border-radius: 6px; border: 1px solid rgba(239, 68, 68, 0.2);">
+                <span class="mono" style="color: #f87171; font-weight: 500; font-size: 0.8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 70%;" title="${item.tool}">${item.tool}</span>
+                <span style="font-size: 0.72rem; background: rgba(239, 68, 68, 0.2); color: #fca5a5; padding: 2px 7px; border-radius: 8px; font-weight: 600; white-space: nowrap;">${item.count} blocked</span>
+              </div>
+            `).join('');
+          }
+
+          // Filtered Out Tools list (Virtual Shielding)
+          const fToolsEl = document.getElementById('sec-tools-filtered-list');
+          const fTools = secRes.filtered_tools || [];
+          const fBadge = document.getElementById('badge-tools-filtered-cnt');
+          if (fBadge) fBadge.textContent = `${fTools.length} tools`;
+          if (fTools.length === 0) {
+            fToolsEl.innerHTML = '<div style="color: var(--text-dim); font-size: 0.8125rem;">No filtered tools recorded yet.</div>';
+          } else {
+            fToolsEl.innerHTML = fTools.map(item => `
+              <div style="display: flex; justify-content: space-between; align-items: center; padding: 6px 10px; background: rgba(30, 41, 59, 0.4); border-radius: 6px; border: 1px solid rgba(139, 92, 246, 0.2);">
+                <span class="mono" style="color: #c084fc; font-weight: 500; font-size: 0.8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 70%;" title="${item.tool}">${item.tool}</span>
+                <span style="font-size: 0.72rem; background: rgba(139, 92, 246, 0.2); color: #c084fc; padding: 2px 7px; border-radius: 8px; font-weight: 600; white-space: nowrap;">${item.count} filtered</span>
+              </div>
+            `).join('');
+          }
+
+          // Key & Role Breakdown Table
+          const tbodySec = document.getElementById('tbody-sec-keys');
+          const keyRows = secRes.by_key_role || [];
+          if (keyRows.length === 0) {
+            tbodySec.innerHTML = '<tr><td colspan="4" style="text-align:center; color: var(--text-dim); padding: 12px;">No key violations logged.</td></tr>';
+          } else {
+            tbodySec.innerHTML = keyRows.map(row => `
+              <tr>
+                <td class="mono" style="color: var(--primary-light); padding: 8px 12px;">${row.key_alias || 'unknown'}</td>
+                <td style="padding: 8px 12px;"><span class="role-badge" style="background: rgba(99, 102, 241, 0.15); color: #a5b4fc; padding: 2px 6px; border-radius: 4px; font-size: 0.75rem;">${row.role || 'developer'}</span></td>
+                <td class="mono" style="color: #f87171; font-weight: 600; padding: 8px 12px;">${row.blocked || 0}</td>
+                <td class="mono" style="color: #c084fc; font-weight: 600; padding: 8px 12px;">${row.filtered || 0}</td>
+              </tr>
+            `).join('');
+          }
+        }
 
         // 1. Update KPIs
         document.getElementById('kpi-total-tasks').textContent = statsRes.total_tasks || 0;
@@ -694,7 +1187,67 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         document.getElementById('kpi-verified-tasks').textContent = statsRes.verified_tasks || 0;
         document.getElementById('kpi-total-spend').textContent = `$${(statsRes.total_spend || 0).toFixed(4)}`;
         document.getElementById('kpi-avg-cps').textContent = statsRes.avg_cps ? `$${statsRes.avg_cps.toFixed(4)}` : '$0.0000';
+        
+        // Fully-Loaded CPS
+        const fullyLoadedEl = document.getElementById('kpi-fully-loaded-cps');
+        const fullyLoadedSub = document.getElementById('kpi-fully-loaded-sub');
+        if ((statsRes.verified_tasks || 0) === 0) {
+          fullyLoadedEl.textContent = 'N/A';
+          fullyLoadedSub.textContent = (statsRes.total_spend || 0) > 0 
+            ? `$${statsRes.total_spend.toFixed(4)} unmerged spend (0 merged)` 
+            : '0 merged tasks';
+        } else {
+          fullyLoadedEl.textContent = `$${(statsRes.fully_loaded_cps || 0).toFixed(4)}`;
+          fullyLoadedSub.textContent = `${statsRes.verified_tasks} merged of ${statsRes.total_tasks} total`;
+        }
+
+        // Success Rate
+        const successRateEl = document.getElementById('kpi-success-rate');
+        const successRateSub = document.getElementById('kpi-success-rate-sub');
+        const ratePct = ((statsRes.success_rate || 0) * 100).toFixed(1);
+        successRateEl.textContent = `${ratePct}%`;
+        successRateSub.textContent = `${statsRes.verified_tasks || 0} of ${statsRes.total_tasks || 0} tasks merged`;
+
         document.getElementById('kpi-zdr-status').textContent = statsRes.zdr_status.includes('100%') ? '100% COMPLIANT' : statsRes.zdr_status;
+
+        // Where the Money Went Breakdown
+        const sByO = statsRes.spend_by_outcome || {};
+        const totalSp = statsRes.total_spend || 0.000001; // Avoid divide by zero
+        const mSpend = sByO.merged || 0;
+        const cSpend = sByO.closed_unmerged || 0;
+        const pSpend = sByO.pending || 0;
+        const bSpend = sByO.blocked_by_policy || 0;
+        const oSpend = sByO.other || 0;
+
+        document.getElementById('badge-spend-total').textContent = `$${(statsRes.total_spend || 0).toFixed(4)} Total`;
+
+        // Progress bar widths
+        const mPct = (statsRes.total_spend || 0) > 0 ? (mSpend / totalSp) * 100 : 0;
+        const cPct = (statsRes.total_spend || 0) > 0 ? (cSpend / totalSp) * 100 : 0;
+        const pPct = (statsRes.total_spend || 0) > 0 ? (pSpend / totalSp) * 100 : 0;
+        const bPct = (statsRes.total_spend || 0) > 0 ? (bSpend / totalSp) * 100 : 0;
+        const oPct = (statsRes.total_spend || 0) > 0 ? (oSpend / totalSp) * 100 : 0;
+
+        document.getElementById('bar-merged').style.width = `${mPct}%`;
+        document.getElementById('bar-closed').style.width = `${cPct}%`;
+        document.getElementById('bar-pending').style.width = `${pPct}%`;
+        document.getElementById('bar-blocked').style.width = `${bPct}%`;
+        document.getElementById('bar-other').style.width = `${oPct}%`;
+
+        document.getElementById('spend-val-merged').textContent = `$${mSpend.toFixed(4)}`;
+        document.getElementById('spend-pct-merged').textContent = `${mPct.toFixed(1)}% of total spend`;
+
+        document.getElementById('spend-val-closed').textContent = `$${cSpend.toFixed(4)}`;
+        document.getElementById('spend-pct-closed').textContent = `${cPct.toFixed(1)}% of total spend`;
+
+        document.getElementById('spend-val-pending').textContent = `$${pSpend.toFixed(4)}`;
+        document.getElementById('spend-pct-pending').textContent = `${pPct.toFixed(1)}% of total spend`;
+
+        document.getElementById('spend-val-blocked').textContent = `$${bSpend.toFixed(4)}`;
+        document.getElementById('spend-pct-blocked').textContent = `${bPct.toFixed(1)}% of total spend`;
+
+        document.getElementById('spend-val-other').textContent = `$${oSpend.toFixed(4)}`;
+        document.getElementById('spend-pct-other').textContent = `${oPct.toFixed(1)}% of total spend`;
 
         // 2. Render CPS Table
         document.getElementById('badge-cps-count').textContent = `${cpsRes.length} Tasks`;
@@ -708,6 +1261,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               statusBadge = '<span class="status-badge status-success">✓ verified_success</span>';
             } else if (t.task_outcome === 'unmerged_closed') {
               statusBadge = '<span class="status-badge status-closed">✕ unmerged_closed</span>';
+            } else if (t.task_outcome === 'tool_policy_rejected') {
+              statusBadge = '<span class="status-badge" style="background:rgba(139,92,246,0.15); color:#a78bfa; border:1px solid rgba(139,92,246,0.3);">⊘ blocked_policy</span>';
+            } else if (t.task_outcome === 'failed') {
+              statusBadge = '<span class="status-badge status-closed">⚠ failed</span>';
             }
             const cpsText = t.final_cps_usd !== null 
               ? `<strong style="color:var(--accent-emerald);">$${Number(t.final_cps_usd).toFixed(6)}</strong>`
@@ -738,10 +1295,28 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             const promptHashShort = r.prompt_sha256 ? `${r.prompt_sha256.substring(0, 8)}...${r.prompt_sha256.substring(56)}` : '-';
             const jaegerLink = `http://${window.location.hostname}:16686/trace/${r.trace_id}`;
             const reqDisplay = highlightText(r.request_id, currentSearchQuery);
+            let policyTag = '';
+            if (r.policy_action) {
+              let tList = [];
+              try {
+                tList = JSON.parse(r.violating_tools || '[]');
+              } catch(e) {
+                tList = (r.violating_tools || '').replace(/[\[\]"]/g, '').split(',').map(s => s.trim()).filter(Boolean);
+              }
+              const count = tList.length;
+              const preview = count <= 2 ? tList.join(', ') : `${tList.slice(0, 2).join(', ')} +${count - 2} more`;
+              const fullList = tList.join('\\n');
+
+              if (r.policy_action === 'strict_reject') {
+                policyTag = `<div style="margin-top:4px;"><span style="display:inline-block; max-width:220px; font-size:0.7rem; background:rgba(239,68,68,0.18); color:#fca5a5; border:1px solid rgba(239,68,68,0.35); padding:2px 8px; border-radius:6px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="${fullList}">⊘ Blocked: ${preview}</span></div>`;
+              } else if (r.policy_action === 'filter') {
+                policyTag = `<div style="margin-top:4px;"><span style="display:inline-block; max-width:220px; font-size:0.7rem; background:rgba(139,92,246,0.18); color:#c084fc; border:1px solid rgba(139,92,246,0.35); padding:2px 8px; border-radius:6px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="${fullList}">🛡️ Filtered: ${preview}</span></div>`;
+              }
+            }
             return `<tr>
               <td style="color:var(--text-dim); font-size:0.75rem;">${r.created_at || '-'}</td>
               <td><span class="mono copyable-req" onclick="copyToClipboard('${r.request_id}', this)" title="Click to copy Request ID">${reqDisplay}</span></td>
-              <td><span class="mono" style="color:var(--text-muted);">${highlightText(r.api_key_alias || 'developer', currentSearchQuery)}</span></td>
+              <td><span class="mono" style="color:var(--text-muted);">${highlightText(r.api_key_alias || 'developer', currentSearchQuery)}</span>${policyTag}</td>
               <td><span style="font-weight:500;">${r.model_routed || r.model_requested}</span></td>
               <td class="mono">${r.latency_ms ? r.latency_ms.toFixed(1) : 0}ms</td>
               <td class="mono">${r.prompt_tokens || 0} / ${r.completion_tokens || 0}</td>
@@ -847,8 +1422,20 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif self.path == "/api/security":
+            data = get_security_stats()
+            data.pop("policy_actions_counter", None)
+            body = json.dumps(data).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         elif self.path in ("/metrics", "/metrics/"):
             stats = get_db_stats()
+            sec_stats = get_security_stats()
+            s_by_o = stats.get("spend_by_outcome", {})
             prom_lines = [
                 "# HELP ai_gateway_tasks_total Total coding tasks recorded by gateway",
                 "# TYPE ai_gateway_tasks_total gauge",
@@ -862,10 +1449,30 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 "# HELP ai_gateway_avg_cps_usd Average Cost Per Successful Task (CPS) in USD",
                 "# TYPE ai_gateway_avg_cps_usd gauge",
                 f"ai_gateway_avg_cps_usd {stats.get('avg_cps', 0.0)}",
+                "# HELP ai_gateway_fully_loaded_cps_usd Fully-loaded Cost Per Successful Task (all spend / merged tasks) in USD",
+                "# TYPE ai_gateway_fully_loaded_cps_usd gauge",
+                f"ai_gateway_fully_loaded_cps_usd {stats.get('fully_loaded_cps', 0.0)}",
+                "# HELP ai_gateway_task_success_ratio Ratio of merged tasks over total tasks (0.0 - 1.0)",
+                "# TYPE ai_gateway_task_success_ratio gauge",
+                f"ai_gateway_task_success_ratio {stats.get('success_rate', 0.0)}",
+                "# HELP ai_gateway_spend_by_outcome_usd Gateway spend categorized by lifecycle outcome",
+                "# TYPE ai_gateway_spend_by_outcome_usd gauge",
+                f'ai_gateway_spend_by_outcome_usd{{outcome="merged"}} {s_by_o.get("merged", 0.0)}',
+                f'ai_gateway_spend_by_outcome_usd{{outcome="closed_unmerged"}} {s_by_o.get("closed_unmerged", 0.0)}',
+                f'ai_gateway_spend_by_outcome_usd{{outcome="pending"}} {s_by_o.get("pending", 0.0)}',
+                f'ai_gateway_spend_by_outcome_usd{{outcome="blocked_by_policy"}} {s_by_o.get("blocked_by_policy", 0.0)}',
+                f'ai_gateway_spend_by_outcome_usd{{outcome="other"}} {s_by_o.get("other", 0.0)}',
                 "# HELP ai_gateway_zdr_compliant Zero Data Retention Invariant Compliance (1 = 100% compliant)",
                 "# TYPE ai_gateway_zdr_compliant gauge",
-                f"ai_gateway_zdr_compliant {1 if '100%' in stats.get('zdr_status', '') else 0}"
+                f"ai_gateway_zdr_compliant {1 if '100%' in stats.get('zdr_status', '') else 0}",
+                "# HELP ai_gateway_spend_avoided_estimated_usd Estimated dollar spend avoided via strict policy rejections",
+                "# TYPE ai_gateway_spend_avoided_estimated_usd gauge",
+                f"ai_gateway_spend_avoided_estimated_usd {sec_stats.get('spend_avoided_estimated_usd', 0.0)}",
+                "# HELP ai_gateway_tool_policy_actions_total Total tool policy actions (strict_reject or filter) by key, role, tool, and action",
+                "# TYPE ai_gateway_tool_policy_actions_total counter"
             ]
+            for (p_key, p_role, p_tool, p_action), p_count in sorted(sec_stats.get("policy_actions_counter", {}).items()):
+                prom_lines.append(f'ai_gateway_tool_policy_actions_total{{key="{p_key}",role="{p_role}",tool="{p_tool}",action="{p_action}"}} {p_count}')
             prom_body = ("\n".join(prom_lines) + "\n").encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
